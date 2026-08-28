@@ -28,67 +28,108 @@
 * `ParentTelegram { user_id: u64 }` — авторизованный родитель через Telegram;
 * `ParentLocalPin` — родитель через локальный ввод PIN-кода в GUI/трее.
 
-### 1.6. `ScheduledAction` (Запланированное действие)
+### 1.6. `ActionExecutionState` (Состояние исполнения действия)
+Жизненный цикл выполнения запланированного действия:
+* `Pending` — действие запланировано и ожидает наступления дедлайна (персистентное нетерминальное состояние);
+* `Executing` — дедлайн наступил или получена немедленная команда, операция передана на исполнение в платформенный слой (персистентное нетерминальное состояние для защиты от сбоев во время вызова);
+* `Completed` — действие успешно исполнено и подтверждено платформенным шлюзом (терминальное состояние, таймер удаляется из активного набора);
+* `Failed { reason: String }` — попытка исполнения завершилась ошибкой платформенного слоя (персистентное состояние, подлежащее повторным попыткам с задержкой);
+* `Missed` — дедлайн наступил во время отключенного состояния системы для действия `ShutdownComputer` (терминальное состояние, таймер аннулируется, отправляется уведомление).
+
+### 1.7. `ScheduledAction` (Запланированное действие)
 Структура, представляющая активное или обрабатываемое системное действие:
 * `id: TimerId` — уникальный идентификатор;
 * `action_kind: ActionKind` — тип действия (`BlockInternet` или `ShutdownComputer`);
 * `deadline: Deadline` — абсолютное время дедлайна (UTC);
 * `created_at: UtcDateTime` — время постановки таймера;
 * `created_by: Initiator` — авторизованный инициатор;
-* `emitted_thresholds: Set<WarningThreshold>` — множество порогов, уведомления по которым уже были эмитированы (для исключения дубликатов);
-* `execution_state: ActionExecutionState` — текущее состояние исполнения (`Pending`, `Executing`, `Completed`, `Failed { reason: String }`, `Missed`).
+* `emitted_thresholds: Set<WarningThreshold>` — множество порогов, уведомления по которым уже были эмитированы или отмечены пройденными;
+* `execution_state: ActionExecutionState` — текущее состояние исполнения.
 
-### 1.7. `WarningEvent` (Событие предупреждения)
-Событие, вычисляемое `core` при достижении очередного порога предупреждения:
+### 1.8. `WarningEvent` (Событие предупреждения)
+Событие, вычисляемое `core` при пересечении очередного порога предупреждения:
 * `timer_id: TimerId` — идентификатор таймера;
 * `action_kind: ActionKind` — тип запланированного действия;
 * `threshold: WarningThreshold` — достигнутый порог;
 * `deadline: Deadline` — целевой дедлайн;
 * `emitted_at: UtcDateTime` — метка времени генерации события.
 
-### 1.8. `InternetState` (Состояние интернет-шлюза)
-Текущий авторитарный режим доступа целевого пользователя к сети Интернет:
-* `Unrestricted` — доступ не ограничен (трафик разрешен);
-* `Blocked` — доступ принудительно заблокирован для SID целевого пользователя.
+### 1.9. `DesiredInternetState` и `InternetState` (Желаемое и Наблюдаемое состояние сети)
+Система строго разделяет целевую политику службы и физически подтвержденное состояние сетевого шлюза:
+* **`DesiredInternetState` (Целевая политика)** — авторитарное намерение службы:
+  * `Unrestricted` — политика свободного доступа;
+  * `Blocked` — политика принудительной блокировки.
+* **`InternetState` (Наблюдаемое состояние шлюза)** — фактически подтвержденное платформой состояние:
+  * `Unrestricted` — доступ физически разрешен шлюзом;
+  * `Blocked` — доступ физически заблокирован шлюзом для целевого SID;
+  * `Unknown` — состояние шлюза не удалось подтвердить из-за ошибки драйвера/платформы.
 
-### 1.9. `ShutdownState` (Состояние питания системы)
+### 1.10. `ShutdownState` (Состояние питания системы)
 Волатильное состояние процесса выключения компьютера во время работы текущей сессии ОС:
 * `Idle` — выключение не запланировано и не выполняется;
 * `Scheduled` — выключение запланировано на определенный `Deadline`;
-* `InProgress` — системный вызов завершения работы ОС Windows передан в ОС.
+* `InProgress` — системный вызов завершения работы передан в ОС Windows в момент наступления дедлайна.
 
-### 1.10. `ChatMessage` (Сообщение чата)
-Сущность текстового сообщения между родителем и ребенком:
-* `id: MessageId` — уникальный идентификатор сообщения;
-* `sender: MessageSender` (`Parent` или `Child`);
-* `text: String` — валидированная строка текста (ограниченного размера);
-* `timestamp: UtcDateTime` — время отправки;
-* `delivery_status: DeliveryStatus` (`Pending`, `DeliveredToService`, `DeliveredToTelegram`, `DeliveredToTray`, `Failed`).
+### 1.11. `StateChangeReason` (Причина изменения состояния)
+Причина, вызвавшая переход сетевого или системного состояния:
+* `TimerExpired { timer_id: TimerId }` — наступление дедлайна таймера;
+* `ImmediateCommand { initiator: Initiator }` — немедленная команда блокировки;
+* `ManualRestore { initiator: Initiator }` — ручная команда снятия блокировки;
+* `StartupRestoration` — восстановление желаемой политики при старте службы;
+* `PlatformSync` — периодическая синхронизация или реакция на сбой платформы.
 
-### 1.11. `ServiceHealth` (Состояние работоспособности службы)
-Диагностическое состояние службы:
-* `status: HealthStatus` (`Healthy`, `Degraded`, `Critical`);
-* `uptime_seconds: u64` — время непрерывной работы службы;
-* `internet_gate_healthy: bool` — исправность подсистемы фильтрации трафика;
-* `persistence_healthy: bool` — доступность и целостность файлов состояния;
-* `telegram_connected: bool` — статус связи с Telegram API;
-* `active_tray_sessions: u32` — количество подключенных клиентов `tray`;
-* `last_error: Option<String>` — описание последней зарегистрированной ошибки.
+### 1.12. `SensitivePinString` (Защищенная строка PIN-кода)
+Обертка над строковым представлением PIN-кода, гарантирующая очистку памяти после использования (zeroize), запрет логирования и запрет неконтролируемой сериализации.
 
-### 1.12. `StatusSnapshot` (Снимок состояния системы)
-Полный агрегированный снимок состояния, формируемый службой для отправки клиентам:
-* `internet_state: InternetState` — текущий режим фильтрации сети;
-* `shutdown_state: ShutdownState` — текущий статус управления питанием;
-* `active_actions: Vec<ScheduledAction>` — перечень активных таймеров;
-* `health: ServiceHealth` — диагностическое состояние службы;
-* `target_child_sid: String` — строковое представление сконфигурированного SID ребенка;
-* `timestamp: UtcDateTime` — время формирования снимка.
+### 1.13. `MessageId` и `MessageSender`
+* `MessageId` — уникальный 128-битный идентификатор текстового сообщения.
+* `MessageSender` — отправитель сообщения: `Parent` или `Child`.
 
-## 2. Алгебраические типы взаимодействия (Commands & Events)
+### 1.14. `DeliveryStatus` (Статус доставки сообщения)
+Статус продвижения сообщения по транспортным узлам:
+* `Pending` — сообщение сформировано клиентом;
+* `AcceptedByService` — принято службой и сохранено в персистентную очередь;
+* `AcceptedByTelegram` — подтверждено сервером Telegram Bot API (HTTP 200 OK / acknowledgement);
+* `DeliveredToTray` — успешно передано по IPC в активное окно трея ребенка;
+* `Failed { reason: String }` — ошибка доставки на одном из этапов.
 
-### 2.1. `Command` (Доменные команды управления)
-Строго типизированные намерения на изменение доменного состояния:
+### 1.15. `HealthStatus` и `ServiceHealth` (Здоровье службы)
+* **`HealthStatus`**:
+  * `Healthy` — все компоненты и адаптеры функционируют штатно;
+  * `Degraded` — возникли некритические сбои (недоступен Telegram, временная ошибка применения правил шлюза в режиме повторов);
+  * `Critical` — критический сбой подсистем безопасности (повреждение базы данных, отказ низкоуровневых драйверов Windows).
+* **`ServiceHealth`**:
+  * `status: HealthStatus` — интегральный статус здоровья;
+  * `uptime_seconds: u64` — время непрерывной работы процесса службы;
+  * `internet_gate_healthy: bool` — исправность подсистемы фильтрации;
+  * `persistence_healthy: bool` — целостность файлов состояния;
+  * `telegram_connected: bool` — доступность Telegram API;
+  * `active_tray_sessions: u32` — число подключенных IPC-клиентов;
+  * `last_error: Option<String>` — текст последней зарегистрированной ошибки.
 
+### 1.16. `ServiceLifecycleStage` (Стадии жизненного цикла службы)
+* `ServiceStarted` — процесс службы Windows запущен, управление передано функции инициализации рантайма;
+* `ServiceReady` — инициализация завершена (персистентное состояние загружено, дескрипторы безопасности настроены, попытка применения `DesiredInternetState` выполнена, служба готова к обработке команд).
+
+### 1.17. `StatusSnapshot` (Снимок состояния системы)
+Агрегированный снимок состояния, формируемый службой для клиентов:
+* `desired_internet_state: DesiredInternetState` — целевая политика сети;
+* `observed_internet_state: InternetState` — фактически подтвержденное состояние шлюза;
+* `shutdown_state: ShutdownState` — статус управления питанием;
+* `active_actions: Vec<ScheduledAction>` — список активных таймеров;
+* `health: ServiceHealth` — диагностика здоровья службы;
+* `target_child_sid: String` — сконфигурированный SID ребенка;
+* `timestamp: UtcDateTime` — метка времени снимка (UTC).
+
+## 2. Недоменные платформенные типы (Non-Domain Platform Types)
+Следующие типы принадлежат платформенному слою (`windows-platform`) и определяются в соответствующих платформенных контрактах:
+* `SecurityIdentifier` — бинарный идентификатор безопасности Windows SID (определен в платформенном слое Windows);
+* `GateError` — тип ошибки шлюза фильтрации (определен в [docs/005-internet-gate-contract.md](./005-internet-gate-contract.md));
+* `PowerError` — тип ошибки подсистемы питания (определен в [docs/006-power-contract.md](./006-power-contract.md)).
+
+## 3. Алгебраические типы взаимодействия (Commands & Events)
+
+### 3.1. `Command` (Доменные команды управления)
 ```rust
 // Концептуальное представление типа Command
 enum Command {
@@ -112,15 +153,13 @@ enum Command {
 }
 ```
 
-*Примечание по протоколу*: Запрос подписки на транспортный поток событий IPC (`SubscribeEvents`) является низкоуровневой операцией управления транспортом IPC, а не доменной командой `Command` (см. [Контракт IPC](./004-ipc-contract.md)).
+*Примечание*: Запрос подписки на транспортный поток событий IPC (`SubscribeEvents`) является низкоуровневой операцией управления транспортом IPC, а не доменной командой `Command` (см. [Контракт IPC](./004-ipc-contract.md)).
 
-### 2.2. `Event` (Доменные события)
-Строго типизированные факты, зарегистрированные в системе:
-
+### 3.2. `Event` (Доменные события)
 ```rust
 // Концептуальное представление типа Event
 enum Event {
-    InternetStateChanged { previous: InternetState, current: InternetState, reason: StateChangeReason },
+    InternetPolicyChanged { desired: DesiredInternetState, observed: InternetState, reason: StateChangeReason },
     ShutdownStateChanged { previous: ShutdownState, current: ShutdownState },
     TimerScheduled { action: ScheduledAction },
     TimerCancelled { id: TimerId, action_kind: ActionKind },
@@ -130,6 +169,6 @@ enum Event {
     ChatMessageReceived { message: ChatMessage },
     PinAuthenticationResult { success: bool, lock_timeout_seconds: Option<u32> },
     ServiceHealthUpdated { health: ServiceHealth },
-    ServiceLifecycleEvent { stage: ServiceLifecycleStage }, // ServiceStarted, ServiceReady
+    ServiceLifecycleEvent { stage: ServiceLifecycleStage },
 }
 ```
