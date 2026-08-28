@@ -6,16 +6,17 @@
 
 Служба `service` обеспечивает надежное долговременное сохранение следующих структур данных:
 
-1. **Активные запланированные действия (`ScheduledAction`)**:
+1. **Целевая сетевая политика (`DesiredInternetState`)**:
+   * Фиксируется авторитарная политика доступа в сеть (`Unrestricted` или `Blocked`).
+   * Немедленные операции `ImmediateInternetBlock` и `RestoreInternet` изменяют исключительно `DesiredInternetState` и **НЕ СОХРАНЯЮТСЯ** как записи `ScheduledAction`.
+   * Волатильное состояние питания `ShutdownState::InProgress` **НЕ СОХРАНЯЕТСЯ** на диск как постоянное состояние загрузки.
+2. **Активные запланированные действия (`ScheduledAction`)**:
    * Для каждого таймера сохраняются: `TimerId`, `ActionKind`, `Deadline` (UTC), `created_at`, `created_by`, `emitted_thresholds` и `ActionExecutionState` (`Pending`, `Executing`, `Failed`).
    * **Инвариант фиксации**: Команда установки или отмены таймера подтверждается только после успешной синхронизации записи на энергонезависимый накопитель (`flush`).
-2. **Целевая сетевая политика (`DesiredInternetState`)**:
-   * Фиксируется авторитарная политика доступа в сеть (`Unrestricted` или `Blocked`).
-   * Волатильное состояние питания `ShutdownState::InProgress` **НЕ СОХРАНЯЕТСЯ** на диск как постоянное состояние загрузки во избежание ложных выключений после включения компьютера.
-3. **Состояние ожидающих повтора операций (Pending/Retryable State)**:
-   * Если применение правила в `InternetGate` завершилось сбоем, состояние ожидания повтора фиксируется на диск, чтобы повторные попытки продолжились после перезапуска службы.
+3. **Метаданные повторных попыток согласования (Reconciliation / Retry Metadata)**:
+   * Если попытка применения сетевой политики в `InternetGate` завершилась ошибкой, метаданные несогласованного состояния фиксируются на диск, чтобы фоновые попытки согласования продолжились после перезапуска службы.
 4. **Очередь сообщений Telegram (`ChatMessageQueue`)**:
-   * Буфер неотправленных исходящих сообщений со статусом доставки (`DeliveryStatus`) сохраняется до подтверждения `AcceptedByTelegram`.
+   * Буфер исходящих сообщений со статусом доставки (`DeliveryStatus`) сохраняется до подтверждения `AcceptedByTelegram`.
 5. **Конфигурация и защищенные учетные данные**:
    * Сконфигурированный `Child SID`.
    * Белый список Telegram `UserId` и `ChatId`.
@@ -42,9 +43,13 @@
    * Факт сбоя регистрируется в системном журнале событий Windows (Event Log).
    * Служба предпринимает попытку отправить экстренное оповещение в Telegram родителям.
 3. **Процедура восстановления при старте**:
-   1. Считывается конфигурация и `DesiredInternetState`. Если зафиксировано `Blocked`, шлюз `InternetGate` восстанавливает блокировку до перехода в `ServiceReady`.
-   2. Считываются активные `ScheduledAction`.
-   3. Вычисляется остаток времени `remaining = Deadline - CurrentUtcTime`:
-      * Для `BlockInternet` при `remaining <= 0` — блокировка применяется немедленно.
+   1. Считывается конфигурация и `DesiredInternetState`.
+   2. Выполняется первичное согласование с платформой:
+      * при `DesiredInternetState == Blocked` служба вызывает `InternetGate::block_internet`;
+      * при `DesiredInternetState == Unrestricted` служба вызывает `InternetGate::unblock_internet`;
+      * фактическое состояние подтверждается через `InternetGate::current_state` до/при переходе в `ServiceReady`.
+   3. Считываются активные `ScheduledAction`.
+   4. Вычисляется остаток времени `remaining = Deadline - CurrentUtcTime`:
+      * Для `BlockInternet` при `remaining <= 0` — дедлайн наступил, политика переводится в `DesiredInternetState::Blocked` с немедленным исполнением.
       * Для `ShutdownComputer` при `remaining <= 0` — действие переводится в `ActionExecutionState::Missed`, таймер аннулируется, статус питания устанавливается в `ShutdownState::Idle`, родителю отправляется уведомление `MissedDeadlineOccurred`.
       * При `remaining > 0` — таймер регистрируется в `core`, а все пороги с `threshold >= remaining` заносятся в `emitted_thresholds` без генерации уведомлений.
