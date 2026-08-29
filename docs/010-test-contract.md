@@ -93,3 +93,113 @@
 * Сообщения от неавторизованных `UserId` / `ChatId` отбрасываются.
 * При переходе службы в состояние готовности доставляется событие `ServiceReady`.
 * При возникновении сбоя хранилища или шлюза доставляется оповещение `ServiceHealthChanged` (`Degraded` / `Critical`), а при восстановлении — оповещение о возврате в `Healthy`.
+
+### 2.12. Верификация подсистемы персистентности и восстановления (Persistence & Recovery Acceptance Tests)
+
+1. **STATE ATOMIC REPLACEMENT — CRASH BEFORE PUBLISH**:
+   * Начальное состояние: валидный канонический файл состояния A.
+   * Во временный файл подготавливается обновленное состояние B.
+   * Симулируется аварийное завершение процесса до вызова атомарной публикации (`ReplaceFileW`).
+   * Результат после перезапуска: каноническое состояние A остается авторитарным. Временный файл B не становится каноническим.
+2. **STATE ATOMIC REPLACEMENT — SUCCESSFUL PUBLISH**:
+   * Существует валидный канонический файл состояния A.
+   * Производится атомарное замещение на валидное состояние B.
+   * Результат: только полное состояние B признается авторитарным; частичные/незавершенные записи исключены.
+3. **MALFORMED STATE**:
+   * Файл `state.json` содержит синтаксически некорректный JSON.
+   * Результат: служба переходит в `HealthStatus::Critical`, событие регистрируется в Event Log, разрешающее состояние `Unrestricted` по умолчанию не применяется, таймеры молчаливо не удаляются.
+4. **UNSUPPORTED SCHEMA VERSION**:
+   * Значение `schema_version` в `state.json` отличается от 1 (например, 2 или 0).
+   * Результат: служба переходит в `HealthStatus::Critical`, автоматическая деструктивная миграция или сброс не выполняются.
+5. **MISSING STATE AFTER INITIALIZATION**:
+   * Файлы `config.json` и `credentials.json` валидны, но файл `state.json` отсутствует после инициализации.
+   * Результат: переход в `HealthStatus::Critical`. Автоматическое создание пустого снимка со статусом `Unrestricted` запрещено.
+6. **VOLATILE FIELDS NOT RECOVERED FROM DISK**:
+   * Проверка структуры `state.json`: файл не содержит полей `observed_internet_state`, `ShutdownState::InProgress`, `uptime_seconds`, токенов IPC-сессий и монотонных меток `Instant`.
+7. **TIMER CREATION DURABILITY**:
+   * Симулируется сбой файловой системы/диска в процессе создания таймера (`ScheduleInternetBlock` / `ScheduleShutdown`).
+   * Результат: команда отклоняется и клиенту не возвращается подтверждение об успешном планировании.
+8. **TIMER CANCELLATION DURABILITY**:
+   * Симулируется сбой сохранения на диск в процессе отмены таймера (`CancelShutdownTimer`).
+   * Результат: отмена не подтверждается как успешная.
+9. **WARNING EQUALITY AFTER DURABLE CREATION**:
+   * Создается таймер с длительностью, в точности равной порогу (например, 30 минут).
+   * Результат: порог `M30` становится доступным для обработки только после успешной фиксации таймера на диске.
+10. **WARNING / OUTBOX COUPLED COMMIT**:
+    * Наступает порог предупреждения, формирующий уведомление в Telegram.
+    * Результат: добавление порога в `emitted_thresholds` и постановка сообщения `ServiceNotification` (с уникальным `entry_id`) в `telegram_outbox` фиксируются в рамках единого атомарного обновления `state.json`.
+11. **SCHEDULED INTERNET CRASH WINDOW**:
+    * При наступлении дедлайна в `state.json` атомарно фиксируются `Executing` и `DesiredInternetState::Blocked`.
+    * Симулируется аварийная остановка службы до вызова `InternetGate::block_internet`.
+    * Результат при перезапуске: служба считывает `DesiredInternetState::Blocked` и инициирует блокировку в `InternetGate`.
+12. **IMMEDIATE BLOCK CRASH WINDOW**:
+    * Атомарно фиксируется `DesiredInternetState::Blocked` для немедленной блокировки.
+    * Симулируется падение службы до вызова драйвера.
+    * Результат при перезапуске: служба производит согласование в сторону `Blocked`.
+13. **RESTORE CRASH WINDOW**:
+    * Атомарно фиксируется `DesiredInternetState::Unrestricted` для команды восстановления.
+    * Симулируется падение службы до вызова драйвера.
+    * Результат при перезапуске: служба производит согласование в сторону `Unrestricted`.
+14. **INTERNET FAILURE SURVIVES RESTART**:
+    * В `state.json` зафиксированы действие `BlockInternet` со статусом `Failed { reason }`, метаданные `internet_retry` и `desired_internet_state = Blocked`.
+    * Результат при перезапуске: действие и намерение согласования не отбрасываются и передаются на повторную обработку.
+15. **TELEGRAM OUTBOX SURVIVES RESTART**:
+    * В `telegram_outbox` сохранено исходящее сообщение в статусе `AcceptedByService`.
+    * Служба перезапускается до сетевой отправки.
+    * Результат: сообщение сохраняется в очереди и подлежит отправке в Telegram.
+16. **TELEGRAM ACK CRASH WINDOW**:
+    * Сообщение успешно принято сервером Telegram Bot API.
+    * Симулируется аварийный сбой до фиксации удаления сообщения из `telegram_outbox` по его `entry_id`.
+    * Результат при перезапуске: сообщение может быть отправлено повторно (гарантия at-least-once). Потеря сообщения исключена.
+17. **TELEGRAM ACK DURABLE REMOVAL**:
+    * Получено подтверждение доставки от Telegram API, обновленный `state.json` с удаленным элементом по `entry_id` зафиксирован на диск.
+    * Результат при перезапуске: сообщение отсутствует в `telegram_outbox`.
+18. **OVERDUE PENDING SHUTDOWN RECOVERY**:
+    * В `state.json` сохранено действие `ShutdownComputer` со статусом `Pending`, дедлайн которого наступил во время остановки службы.
+    * Результат при старте службы: вызов `PowerController::initiate_shutdown` **НЕ производится**, действие удаляется из `active_actions`, статус питания переходит в `ShutdownState::Idle`, в `telegram_outbox` помещается уведомление `MissedDeadlineOccurred`.
+19. **OVERDUE EXECUTING SHUTDOWN RECOVERY**:
+    * В `state.json` сохранено действие `ShutdownComputer` со статусом `Executing` с просроченным дедлайном.
+    * Сохраненное состояние `Executing` может отражать сбой до вызова платформы, сбой во время платформенного вызова или сбой после `Ok(())` до публикации удаления.
+    * Результат при старте службы: служба не пытается разделять эти случаи, повторный вызов `PowerController::initiate_shutdown` **НЕ производится**, действие удаляется из `active_actions`, формируется уведомление `MissedDeadlineOccurred`.
+20. **OVERDUE FAILED SHUTDOWN RECOVERY**:
+    * В `state.json` сохранено действие `ShutdownComputer` со статусом `Failed` с просроченным дедлайном.
+    * Результат при старте службы: вызов выключения **НЕ производится**, действие удаляется из активных, формируется уведомление `MissedDeadlineOccurred`.
+21. **DUPLICATE TIMER ID**:
+    * В `state.json` внедрен дубликат `TimerId` в коллекции `active_actions`.
+    * Результат: состояние отвергается как поврежденное (`HealthStatus::Critical`), скрытая автоматическая дедупликация запрещена.
+22. **STALE TEMP FILE**:
+    * В каталоге `%ProgramData%\Palka` присутствует валидный `state.json` и оставшийся устаревший файл `.state.json.tmp` (с более старой или более новой датой изменения).
+    * Результат: авторитарным признается канонический `state.json`, автоматическое продвижение временного файла исключено.
+23. **PLAINTEXT SECRET ABSENCE**:
+    * Проверка содержимого `credentials.json`: файл содержит исключительно Argon2id-хэш PIN-кода и DPAPI-зашифрованный blob токена Telegram Bot API; открытый PIN-код и открытый токен на диске отсутствуют.
+24. **OUTBOX CHAT DOMAIN VALIDITY**:
+    * Доменный тип `ChatMessage` поддерживает отправителей `Parent` и `Child` в общем случае.
+    * В `telegram_outbox` персистируется полезная нагрузка `Chat` с объектом `ChatMessage`.
+    * Верификация: транспорт очереди `telegram_outbox` принимает **СТРОГО** значение `sender: "Child"`. Значение `"Parent"` внутри `telegram_outbox` отклоняется схемой как недопустимая маршрутизация/формат для данного транспорта. Значения `"Service"`, `"System"`, `"Bot"` отклоняются как недопустимые варианты `MessageSender`.
+25. **OUTBOX SERVICE NOTIFICATION SEPARATION**:
+    * В `telegram_outbox` персистируется полезная нагрузка `ServiceNotification`.
+    * Верификация: запись не декодируется как `ChatMessage`, не содержит поля `sender` и сохраняет готовность к надежной передаче в Telegram.
+26. **EXACT TAGGED STATE ENCODING**:
+    * Проверка точной схемы v1 для тегированных объектов: `Pending` (`{"kind": "Pending"}`), `Executing` (`{"kind": "Executing"}`), `Failed` (`{"kind": "Failed", "reason": "..."}`), `ParentLocalPin` (`{"kind": "ParentLocalPin"}`), `ParentTelegram` (`{"kind": "ParentTelegram", "user_id": ...}`).
+    * Некорректные теги или отсутствие обязательного поля `reason` в `Failed` приводят к отклонению состояния как невалидного.
+27. **UNKNOWN V1 FIELD REJECTION**:
+    * В корневую структуру или вложенные объекты схемы v1 внедряется неизвестное поле (например, `"unknown_field": 123`).
+    * Верификация: файл состояния отклоняется как невалидный (`HealthStatus::Critical`), скрытое игнорирование неизвестных полей запрещено.
+28. **PERSISTENCE CORRUPTION EMERGENCY TELEGRAM**:
+    * Файл `state.json` поврежден или не читается, файлы `config.json` и `credentials.json` валидны.
+    * Верификация: штатная очередь `telegram_outbox` не используется, служба вправе выполнить только прямую негарантированную попытку экстренного оповещения об аварии хранилища (best-effort без статуса `AcceptedByService`).
+29. **CORRUPT REQUIRED FILE PREVENTS SERVICE READY**:
+    * Любой из обязательных канонических файлов поврежден или отсутствует.
+    * Верификация: здоровье переходит в `HealthStatus::Critical`, событие `ServiceReady` **КАТЕГОРИЧЕСКИ НЕ ЭМИТИРУЕТСЯ**.
+30. **OUTBOX ENTRY ID UNIQUENESS**:
+    * В `telegram_outbox` внедряются две записи с одинаковым значением `entry_id`.
+    * Верификация: `state.json` отклоняется как невалидный.
+    * Дополнительно верифицируется, что две записи `ServiceNotification` с идентичным текстом `text`, но разными уникальными `entry_id`, признаются валидными независимыми элементами очереди.
+31. **RUNTIME SHUTDOWN SUCCESS TERMINALIZATION**:
+    * Действие `ShutdownComputer` в статусе `Pending` достигает дедлайна.
+    * Последовательность: `Pending` -> атомарная фиксация `Executing` на диске -> вызов `initiate_shutdown()` возвращает `Ok(())` -> волатильный `ShutdownState::InProgress` -> перевод в `Completed` в ядре -> атомарная публикация `state.json` с удалением действия из `active_actions`.
+    * Верификация: после успешной публикации удаления и последующего перезапуска просроченное действие выключения на диске отсутствует.
+32. **RUNTIME SHUTDOWN FAILURE DURABILITY**:
+    * Действие `ShutdownComputer` в статусе `Pending` достигает дедлайна.
+    * Последовательность: персистируется `Executing` -> вызов `initiate_shutdown()` возвращает `Err(PowerError)` -> действие переходит в `Failed { reason }` и персистируется в `active_actions`.
+    * Верификация: статус `ShutdownState::InProgress` не устанавливается. При последующем перезапуске с просроченным дедлайном выключение не вызывается повторно и применяется политика `Missed`.
