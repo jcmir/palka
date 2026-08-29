@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "palka-core"
 version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "palka-service"
@@ -27,3 +30,9 @@ version = "0.1.0"
 dependencies = [
  "palka-core",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
