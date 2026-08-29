@@ -134,6 +134,86 @@ pub const fn deadline_is_due(current_remaining_seconds: i64) -> bool {
     current_remaining_seconds <= 0
 }
 
+/// Determines the next execution state when a runtime deadline arrives.
+///
+/// If `current_remaining_seconds <= 0` and `current_state` is `Pending`, transitions to `Executing`.
+/// For all other states or when remaining time is positive, returns `None`.
+pub fn runtime_deadline_transition(
+    current_state: &ActionExecutionState,
+    current_remaining_seconds: i64,
+) -> Option<ActionExecutionState> {
+    if deadline_is_due(current_remaining_seconds)
+        && matches!(current_state, ActionExecutionState::Pending)
+    {
+        Some(ActionExecutionState::Executing)
+    } else {
+        None
+    }
+}
+
+/// Determines the next execution state upon successful execution by the platform layer.
+///
+/// Transitions from `Executing` to `Completed`. For all other states returns `None`.
+pub fn execution_success_transition(
+    current_state: &ActionExecutionState,
+) -> Option<ActionExecutionState> {
+    if matches!(current_state, ActionExecutionState::Executing) {
+        Some(ActionExecutionState::Completed)
+    } else {
+        None
+    }
+}
+
+/// Determines the next execution state upon execution failure by the platform layer.
+///
+/// Transitions from `Executing` to `Failed { reason }`. For all other states returns `None`.
+pub fn execution_failure_transition(
+    current_state: &ActionExecutionState,
+    reason: String,
+) -> Option<ActionExecutionState> {
+    if matches!(current_state, ActionExecutionState::Executing) {
+        Some(ActionExecutionState::Failed { reason })
+    } else {
+        None
+    }
+}
+
+/// Determines the overdue transition for an action recovered after startup when `current_remaining_seconds <= 0`.
+///
+/// Only applies to `Pending` actions.
+/// `ActionKind::BlockInternet` transitions to `Executing` (enforcement/reconciliation proceeds).
+/// `ActionKind::ShutdownComputer` transitions to `Missed` (past-deadline shutdown is not executed).
+/// For non-overdue (`current_remaining_seconds > 0`) or non-`Pending` states returns `None`.
+pub fn recovery_overdue_transition(
+    action_kind: ActionKind,
+    current_state: &ActionExecutionState,
+    current_remaining_seconds: i64,
+) -> Option<ActionExecutionState> {
+    if !deadline_is_due(current_remaining_seconds)
+        || !matches!(current_state, ActionExecutionState::Pending)
+    {
+        return None;
+    }
+
+    match action_kind {
+        ActionKind::BlockInternet => Some(ActionExecutionState::Executing),
+        ActionKind::ShutdownComputer => Some(ActionExecutionState::Missed),
+    }
+}
+
+/// Predicate checking if an action execution state is terminal (`Completed` or `Missed`).
+pub const fn action_state_is_terminal(state: &ActionExecutionState) -> bool {
+    matches!(
+        state,
+        ActionExecutionState::Completed | ActionExecutionState::Missed
+    )
+}
+
+/// Checks if cancellation of a scheduled shutdown is allowed based on the time boundary (`current_remaining_seconds > 0`).
+pub const fn shutdown_cancel_allowed(current_remaining_seconds: i64) -> bool {
+    !deadline_is_due(current_remaining_seconds)
+}
+
 /// Subject that initiated an action or policy change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Initiator {
@@ -629,5 +709,198 @@ mod tests {
         assert!(!deadline_is_due(1));
         assert!(deadline_is_due(0));
         assert!(deadline_is_due(-1));
+    }
+
+    #[test]
+    fn runtime_pending_at_deadline_enters_executing() {
+        let next = runtime_deadline_transition(&ActionExecutionState::Pending, 0);
+        assert_eq!(next, Some(ActionExecutionState::Executing));
+    }
+
+    #[test]
+    fn runtime_pending_before_deadline_does_not_transition() {
+        let next = runtime_deadline_transition(&ActionExecutionState::Pending, 1);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn runtime_pending_after_deadline_enters_executing() {
+        let next = runtime_deadline_transition(&ActionExecutionState::Pending, -1);
+        assert_eq!(next, Some(ActionExecutionState::Executing));
+    }
+
+    #[test]
+    fn runtime_non_pending_states_do_not_reenter_execution() {
+        assert_eq!(
+            runtime_deadline_transition(&ActionExecutionState::Executing, 0),
+            None
+        );
+        assert_eq!(
+            runtime_deadline_transition(&ActionExecutionState::Completed, 0),
+            None
+        );
+        assert_eq!(
+            runtime_deadline_transition(
+                &ActionExecutionState::Failed {
+                    reason: "err".to_string()
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            runtime_deadline_transition(&ActionExecutionState::Missed, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn execution_success_only_from_executing() {
+        assert_eq!(
+            execution_success_transition(&ActionExecutionState::Executing),
+            Some(ActionExecutionState::Completed)
+        );
+        assert_eq!(
+            execution_success_transition(&ActionExecutionState::Pending),
+            None
+        );
+        assert_eq!(
+            execution_success_transition(&ActionExecutionState::Completed),
+            None
+        );
+    }
+
+    #[test]
+    fn execution_failure_only_from_executing_and_preserves_reason() {
+        assert_eq!(
+            execution_failure_transition(
+                &ActionExecutionState::Executing,
+                "platform failure".to_string()
+            ),
+            Some(ActionExecutionState::Failed {
+                reason: "platform failure".to_string()
+            })
+        );
+        assert_eq!(
+            execution_failure_transition(
+                &ActionExecutionState::Pending,
+                "platform failure".to_string()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_and_missed_are_terminal() {
+        assert!(action_state_is_terminal(&ActionExecutionState::Completed));
+        assert!(action_state_is_terminal(&ActionExecutionState::Missed));
+    }
+
+    #[test]
+    fn pending_executing_and_failed_are_nonterminal() {
+        assert!(!action_state_is_terminal(&ActionExecutionState::Pending));
+        assert!(!action_state_is_terminal(&ActionExecutionState::Executing));
+        assert!(!action_state_is_terminal(&ActionExecutionState::Failed {
+            reason: "err".to_string()
+        }));
+    }
+
+    #[test]
+    fn recovery_overdue_internet_pending_enters_executing() {
+        let next = recovery_overdue_transition(
+            ActionKind::BlockInternet,
+            &ActionExecutionState::Pending,
+            0,
+        );
+        assert_eq!(next, Some(ActionExecutionState::Executing));
+    }
+
+    #[test]
+    fn recovery_overdue_shutdown_pending_becomes_missed() {
+        let next = recovery_overdue_transition(
+            ActionKind::ShutdownComputer,
+            &ActionExecutionState::Pending,
+            0,
+        );
+        assert_eq!(next, Some(ActionExecutionState::Missed));
+    }
+
+    #[test]
+    fn recovery_before_deadline_does_not_transition() {
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::BlockInternet,
+                &ActionExecutionState::Pending,
+                1,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Pending,
+                1,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_non_pending_states_do_not_apply_pending_overdue_rule() {
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::BlockInternet,
+                &ActionExecutionState::Executing,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Executing,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::BlockInternet,
+                &ActionExecutionState::Failed {
+                    reason: "err".to_string()
+                },
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Failed {
+                    reason: "err".to_string()
+                },
+                0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn overdue_internet_never_uses_missed_transition() {
+        let next = recovery_overdue_transition(
+            ActionKind::BlockInternet,
+            &ActionExecutionState::Pending,
+            -1,
+        );
+        assert_eq!(next, Some(ActionExecutionState::Executing));
+        assert_ne!(next, Some(ActionExecutionState::Missed));
+    }
+
+    #[test]
+    fn shutdown_cancel_boundary_is_strictly_before_deadline() {
+        assert!(shutdown_cancel_allowed(1));
+        assert!(shutdown_cancel_allowed(180));
+        assert!(!shutdown_cancel_allowed(0));
+        assert!(!shutdown_cancel_allowed(-1));
     }
 }
