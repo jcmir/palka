@@ -39,10 +39,99 @@ pub enum WarningThreshold {
 }
 
 impl WarningThreshold {
+    /// All fixed warning thresholds in deterministic descending order.
+    pub const ALL: [Self; 5] = [Self::M60, Self::M30, Self::M20, Self::M10, Self::M3];
+
     /// Returns the threshold duration in seconds.
     pub const fn seconds(self) -> u32 {
         self as u32
     }
+}
+
+/// Returns the set of thresholds that are already in the past when creating a timer of `duration_seconds`.
+///
+/// A threshold is passed if `duration_seconds < threshold.seconds()`.
+/// Exact equality (`duration_seconds == threshold.seconds()`) is NOT considered passed.
+pub fn creation_passed_thresholds(duration_seconds: u64) -> HashSet<WarningThreshold> {
+    let mut passed = HashSet::new();
+    for threshold in WarningThreshold::ALL {
+        if duration_seconds < threshold.seconds() as u64 {
+            passed.insert(threshold);
+        }
+    }
+    passed
+}
+
+/// Returns the threshold that is due immediately upon timer creation because `duration_seconds == threshold.seconds()`.
+///
+/// Under the fixed contract, at most one threshold can match.
+/// The returned list follows descending order: M60, M30, M20, M10, M3.
+pub fn creation_due_thresholds(duration_seconds: u64) -> Vec<WarningThreshold> {
+    let mut due = Vec::new();
+    for threshold in WarningThreshold::ALL {
+        if duration_seconds == threshold.seconds() as u64 {
+            due.push(threshold);
+        }
+    }
+    due
+}
+
+/// Determines which warning thresholds were crossed between `previous_remaining_seconds` and `current_remaining_seconds`.
+///
+/// If `current_remaining_seconds <= 0`, deadline execution has priority and no warning thresholds are returned.
+/// Thresholds already in `emitted_thresholds` are not returned.
+/// Returned in deterministic descending order (M60 .. M3).
+pub fn crossed_warning_thresholds(
+    previous_remaining_seconds: i64,
+    current_remaining_seconds: i64,
+    emitted_thresholds: &HashSet<WarningThreshold>,
+) -> Vec<WarningThreshold> {
+    if current_remaining_seconds <= 0 {
+        return Vec::new();
+    }
+
+    let mut crossed = Vec::new();
+    for threshold in WarningThreshold::ALL {
+        let threshold_seconds = threshold.seconds() as i64;
+        if previous_remaining_seconds > threshold_seconds
+            && current_remaining_seconds <= threshold_seconds
+            && !emitted_thresholds.contains(&threshold)
+        {
+            crossed.push(threshold);
+        }
+    }
+    crossed
+}
+
+/// For a timer recovered before its deadline (`current_remaining_seconds > 0`), returns all not-yet-emitted
+/// thresholds satisfying `threshold.seconds() >= current_remaining_seconds`.
+///
+/// These thresholds were crossed while the service was unavailable and must be marked as passed without retroactive warning emission.
+/// If `current_remaining_seconds <= 0`, deadline handling has priority and an empty vector is returned.
+/// Returned in deterministic descending order (M60 .. M3).
+pub fn recovery_passed_thresholds(
+    current_remaining_seconds: i64,
+    emitted_thresholds: &HashSet<WarningThreshold>,
+) -> Vec<WarningThreshold> {
+    if current_remaining_seconds <= 0 {
+        return Vec::new();
+    }
+
+    let mut passed = Vec::new();
+    for threshold in WarningThreshold::ALL {
+        let threshold_seconds = threshold.seconds() as i64;
+        if threshold_seconds >= current_remaining_seconds
+            && !emitted_thresholds.contains(&threshold)
+        {
+            passed.push(threshold);
+        }
+    }
+    passed
+}
+
+/// Predicate checking if the deadline condition is reached (`current_remaining_seconds <= 0`).
+pub const fn deadline_is_due(current_remaining_seconds: i64) -> bool {
+    current_remaining_seconds <= 0
 }
 
 /// Subject that initiated an action or policy change.
@@ -382,5 +471,163 @@ mod tests {
     fn sensitive_pin_string_exposes_borrowed_value() {
         let pin = SensitivePinString::new("1234".to_string());
         assert_eq!(pin.as_str(), "1234");
+    }
+
+    #[test]
+    fn creation_above_all_thresholds_marks_none_passed() {
+        let duration = 61 * 60;
+        let passed = creation_passed_thresholds(duration);
+        assert!(passed.is_empty());
+    }
+
+    #[test]
+    fn creation_equal_m30_marks_m60_passed_and_m30_due() {
+        let duration = 30 * 60;
+        let passed = creation_passed_thresholds(duration);
+        let due = creation_due_thresholds(duration);
+
+        assert_eq!(passed.len(), 1);
+        assert!(passed.contains(&WarningThreshold::M60));
+        assert!(!passed.contains(&WarningThreshold::M30));
+
+        assert_eq!(due, vec![WarningThreshold::M30]);
+    }
+
+    #[test]
+    fn creation_shorter_than_thresholds_marks_only_past_thresholds() {
+        let duration = 18 * 60;
+        let passed = creation_passed_thresholds(duration);
+        let due = creation_due_thresholds(duration);
+
+        assert_eq!(passed.len(), 3);
+        assert!(passed.contains(&WarningThreshold::M60));
+        assert!(passed.contains(&WarningThreshold::M30));
+        assert!(passed.contains(&WarningThreshold::M20));
+        assert!(!passed.contains(&WarningThreshold::M10));
+        assert!(!passed.contains(&WarningThreshold::M3));
+
+        assert!(due.is_empty());
+    }
+
+    #[test]
+    fn crossing_jump_over_m10_returns_m10() {
+        let previous = 605;
+        let current = 598;
+        let emitted = HashSet::new();
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert_eq!(crossed, vec![WarningThreshold::M10]);
+    }
+
+    #[test]
+    fn crossing_exactly_to_threshold_returns_threshold() {
+        let previous = 601;
+        let current = 600;
+        let emitted = HashSet::new();
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert_eq!(crossed, vec![WarningThreshold::M10]);
+    }
+
+    #[test]
+    fn crossing_does_not_repeat_emitted_threshold() {
+        let previous = 605;
+        let current = 598;
+        let mut emitted = HashSet::new();
+        emitted.insert(WarningThreshold::M10);
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn crossing_multiple_thresholds_is_deterministic() {
+        let previous = 3700;
+        let current = 100;
+        let emitted = HashSet::new();
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert_eq!(
+            crossed,
+            vec![
+                WarningThreshold::M60,
+                WarningThreshold::M30,
+                WarningThreshold::M20,
+                WarningThreshold::M10,
+                WarningThreshold::M3,
+            ]
+        );
+    }
+
+    #[test]
+    fn deadline_priority_at_zero_suppresses_all_warnings() {
+        let previous = 3700;
+        let current = 0;
+        let emitted = HashSet::new();
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn deadline_priority_after_deadline_suppresses_all_warnings() {
+        let previous = 3700;
+        let current = -1;
+        let emitted = HashSet::new();
+
+        let crossed = crossed_warning_thresholds(previous, current, &emitted);
+        assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn recovery_at_eighteen_minutes_marks_m60_m30_m20_passed() {
+        let current = 1080;
+        let emitted = HashSet::new();
+
+        let passed = recovery_passed_thresholds(current, &emitted);
+        assert_eq!(
+            passed,
+            vec![
+                WarningThreshold::M60,
+                WarningThreshold::M30,
+                WarningThreshold::M20,
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_already_emitted_information() {
+        let current = 1080;
+        let mut emitted = HashSet::new();
+        emitted.insert(WarningThreshold::M30);
+
+        let passed = recovery_passed_thresholds(current, &emitted);
+        assert_eq!(passed, vec![WarningThreshold::M60, WarningThreshold::M20]);
+    }
+
+    #[test]
+    fn recovery_keeps_lower_future_thresholds_eligible() {
+        let current = 1080;
+        let emitted = HashSet::new();
+
+        let passed = recovery_passed_thresholds(current, &emitted);
+        assert!(!passed.contains(&WarningThreshold::M10));
+        assert!(!passed.contains(&WarningThreshold::M3));
+    }
+
+    #[test]
+    fn recovery_at_deadline_returns_no_warning_transitions() {
+        let current = 0;
+        let emitted = HashSet::new();
+
+        let passed = recovery_passed_thresholds(current, &emitted);
+        assert!(passed.is_empty());
+    }
+
+    #[test]
+    fn deadline_predicate_matches_contract_boundary() {
+        assert!(!deadline_is_due(1));
+        assert!(deadline_is_due(0));
+        assert!(deadline_is_due(-1));
     }
 }
