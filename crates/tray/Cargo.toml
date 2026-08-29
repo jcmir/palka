@@ -1,0 +1,7 @@
+[package]
+name = "palka-tray"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+palka-core = { path = "../core" }

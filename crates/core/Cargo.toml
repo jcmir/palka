@@ -1,0 +1,4 @@
+[package]
+name = "palka-core"
+version.workspace = true
+edition.workspace = true

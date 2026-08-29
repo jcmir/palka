@@ -1,0 +1,8 @@
+[package]
+name = "palka-service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+palka-core = { path = "../core" }
+palka-windows-platform = { path = "../windows-platform" }
