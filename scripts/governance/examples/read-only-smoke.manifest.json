@@ -1,0 +1,76 @@
+{
+  "schema": "palka.operation-manifest/v1",
+  "operation_id": "EXAMPLE-READ-ONLY-SMOKE",
+  "repository": "jcmir/palka",
+  "working_directory": "C:\\PALKA",
+  "stage": "IMPLEMENTATION",
+  "branch": "feat/dec-003-phase-2a-governance-engine-core",
+  "expected_start_branch": "feat/dec-003-phase-2a-governance-engine-core",
+  "target_branch": "feat/dec-003-phase-2a-governance-engine-core",
+  "expected_head": "<40-hex-head-sha>",
+  "expected_base": "<40-hex-base-sha>",
+  "expected_remote_refs": {
+    "origin/main": "<40-hex-origin-main-sha>"
+  },
+  "authorized_paths": [
+    "scripts/governance/**"
+  ],
+  "forbidden_paths": [
+    "crates/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".github/**"
+  ],
+  "branch_transition": {
+    "allowed": false
+  },
+  "refresh_commands": [
+    {
+      "id": "refresh-origin",
+      "executable": "git",
+      "arguments": [
+        "fetch",
+        "origin"
+      ],
+      "cwd": "C:\\PALKA",
+      "mutating": false,
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ],
+  "required_preconditions": [
+    {
+      "id": "check-working-tree",
+      "executable": "git",
+      "arguments": [
+        "status",
+        "--short"
+      ],
+      "cwd": "C:\\PALKA",
+      "mutating": false,
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ],
+  "already_satisfied_checks": [],
+  "authorized_commands": [
+    {
+      "id": "verify-head-rev",
+      "executable": "git",
+      "arguments": [
+        "rev-parse",
+        "HEAD"
+      ],
+      "cwd": "C:\\PALKA",
+      "mutating": false,
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ],
+  "required_postconditions": [],
+  "artifact_profile": "bootstrap_zip_v1",
+  "stop_conditions": []
+}
