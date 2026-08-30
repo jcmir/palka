@@ -13,7 +13,7 @@ Import-Module $govModule -Force
 
 $passCount = 0
 $failCount = 0
-$totalTests = 68
+$totalTests = 86
 $outputRoot = Join-Path $env:TEMP 'palka-selftest-runs-r3'
 if (Test-Path $outputRoot) { Remove-Item -Recurse -Force $outputRoot }
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
@@ -36,7 +36,7 @@ function Report-Fail {
 try {
     $repo = New-TestGitRepo 't01'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{ 'unknown_extra_field' = 'bad_value' }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Unknown top-level field') {
         Report-Pass 'T01' 'manifest rejects unknown top-level field'
     } else {
@@ -55,7 +55,7 @@ try {
 try {
     $repo = New-TestGitRepo 't02'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha '572f9d2'
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'expected_head must be exactly 40') {
         Report-Pass 'T02' 'manifest rejects abbreviated SHA'
     } else {
@@ -74,7 +74,7 @@ try {
 try {
     $repo = New-TestGitRepo 't03'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -Stage 'INVALID_STAGE_NAME'
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Invalid stage') {
         Report-Pass 'T03' 'invalid stage rejected'
     } else {
@@ -96,7 +96,7 @@ try {
         'target_branch' = 'feature-branch'
         'branch_transition' = [ordered]@{ 'allowed' = $false }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'expected_start_branch, target_branch and branch must be identical') {
         Report-Pass 'T04' 'branch model invalid when transition=false but branches differ'
     } else {
@@ -136,7 +136,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $configCheck = & git -C $repo.RepoDir config test.marker 2>$null
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $null -eq $configCheck) {
         Report-Pass 'T05' 'precondition mismatch STOPs before mutating action'
@@ -180,7 +180,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $configCheck = & git -C $repo.RepoDir config test.already.marker 2>$null
     if ($res.result -eq 'ALREADY_SATISFIED' -and $res.mutation_state -eq 'NONE' -and $null -eq $configCheck) {
         Report-Pass 'T06' 'ALREADY_SATISFIED skips mutating action'
@@ -224,7 +224,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'APPLIED') {
         Report-Pass 'T07' 'successful mutating action plus passing postcondition'
     } else {
@@ -254,7 +254,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'UNKNOWN') {
         Report-Pass 'T08' 'failed mutating action'
     } else {
@@ -284,7 +284,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $evidenceDir = Join-Path $res.run_directory 'evidence'
     $stdoutFile = (Get-ChildItem -Path $evidenceDir -Filter '*cmd-with-stderr-stdout.txt')[0].FullName
     $stderrFile = (Get-ChildItem -Path $evidenceDir -Filter '*cmd-with-stderr-stderr.txt')[0].FullName
@@ -319,7 +319,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $rec = $null
@@ -356,7 +356,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Globally forbidden git subcommand: git reset') {
         Report-Pass 'T11' 'forbidden git reset --hard rejected before launch'
     } else {
@@ -386,7 +386,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Globally forbidden git push flag') {
         Report-Pass 'T12' 'forbidden force push form rejected before launch'
     } else {
@@ -419,7 +419,7 @@ try {
         )
     }
     [System.IO.File]::WriteAllText($unauthFile, 'secret', [System.Text.UTF8Encoding]::new($false))
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'UNKNOWN' -and $res.reason -match 'Scope violation') {
         Report-Pass 'T13' 'unauthorized worktree path causes STOPPED / UNKNOWN'
     } else {
@@ -455,7 +455,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'APPLIED') {
         Report-Pass 'T14' 'authorized path change succeeds in a temporary repo'
     } else {
@@ -549,7 +549,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Duplicate command id') {
         Report-Pass 'T19' 'command IDs must be unique'
     } else {
@@ -582,7 +582,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $evidenceDir = Join-Path $res.run_directory 'evidence'
     $stdoutFile = (Get-ChildItem -Path $evidenceDir -Filter '*empty-stdout-cmd-stdout.txt')[0].FullName
     $stdoutBytes = [System.IO.File]::ReadAllBytes($stdoutFile)
@@ -625,7 +625,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $validObjects = 0
@@ -682,7 +682,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $c1 = & git -C $repo.RepoDir config test.act1 2>$null
     $c2 = & git -C $repo.RepoDir config test.act2 2>$null
     if ($res.result -eq 'STOPPED' -and $null -eq $c1 -and $null -eq $c2) {
@@ -714,7 +714,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Forbidden force/prune flag in refresh_commands') {
         Report-Pass 'T23' 'refresh command rejects git fetch --force'
     } else {
@@ -744,7 +744,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $rec = $null
@@ -794,7 +794,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'UNKNOWN' -and $res.reason -match 'stdout mismatch') {
         Report-Pass 'T25' 'postcondition failure after successful mutation results in STOPPED, UNKNOWN'
     } else {
@@ -824,7 +824,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $evidenceFiles = Get-ChildItem -Path (Join-Path $res.run_directory 'evidence')
@@ -858,7 +858,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.reason -match 'Globally forbidden git subcommand: git reset') {
         Report-Pass 'T27' 'git -C <repo> reset --hard is rejected before launch'
     } else {
@@ -888,7 +888,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = @(
@@ -902,7 +902,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'Globally forbidden git push flag' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'Globally forbidden git push force refspec') {
@@ -935,7 +935,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = @(
@@ -949,7 +949,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'Opaque shell wrapper rejected' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'Opaque shell wrapper rejected') {
@@ -982,7 +982,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'already_satisfied_checks' = @(
@@ -996,7 +996,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m3 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'required_postconditions' = @(
@@ -1010,7 +1010,7 @@ try {
             }
         )
     }
-    $res3 = Invoke-PalkaEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res3 = Invoke-TestEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'must have mutating: false' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'must have mutating: false' -and
@@ -1055,7 +1055,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $marker = & git -C $repo.RepoDir config test.t31.marker 2>$null
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Policy violation' -and $null -eq $marker) {
         Report-Pass 'T31' 'dangerous/policy failure inside already_satisfied_checks causes STOPPED'
@@ -1094,7 +1094,7 @@ try {
             'origin/test-branch' = 'ABSENT'
         }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'expected ABSENT but was found on remote') {
         Report-Pass 'T32' 'expected_remote_refs origin/test=ABSENT fails when test branch exists'
     } else {
@@ -1117,7 +1117,7 @@ try {
             'origin/nonexistent-feature' = 'ABSENT'
         }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'NONE') {
         Report-Pass 'T33' 'expected_remote_refs origin/test=ABSENT succeeds when branch is absent'
     } else {
@@ -1137,7 +1137,7 @@ try {
     $repo = New-TestGitRepo 't34'
     $insideOutput = Join-Path $repo.RepoDir 'artifacts-inside'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $insideOutput -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $insideOutput -PassThru
     $createdInside = Test-Path $insideOutput
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'must not be equal to or inside working_directory' -and -not $createdInside) {
         Report-Pass 'T34' 'OutputRoot inside working_directory is rejected'
@@ -1157,7 +1157,7 @@ try {
 try {
     $repo = New-TestGitRepo 't35'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -OperationId '../../traversal'
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Invalid operation_id') {
         Report-Pass 'T35' 'operation_id path traversal attempt is rejected'
     } else {
@@ -1175,10 +1175,18 @@ try {
 # ----------------------------------------------------
 try {
     $malformedPath = Join-Path $env:TEMP 'malformed.json'
-    [System.IO.File]::WriteAllText($malformedPath, '{ this is not valid JSON }')
+    [System.IO.File]::WriteAllText($malformedPath, '{ this is not valid JSON }', [System.Text.UTF8Encoding]::new($false))
+    $malformedSha = Get-TestManifestSha256 $malformedPath
+
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $malformedPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $malformedSha -PassThru -TestPostStartHook $hook
+
+    $enginePass = ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_READ' -and $res.reason -match 'Malformed JSON' -and $nativeCount -eq 0)
+
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo.FileName = 'powershell.exe'
-    $proc.StartInfo.Arguments = "-ExecutionPolicy Bypass -File C:\PALKA\scripts\governance\Invoke-PalkaOperation.ps1 -ManifestPath `"$malformedPath`" -OutputRoot `"$outputRoot`""
+    $proc.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File C:\PALKA\scripts\governance\Invoke-PalkaOperation.ps1 -ManifestPath `"$malformedPath`" -OutputRoot `"$outputRoot`" -AuthorizedManifestSha256 $malformedSha"
     $proc.StartInfo.WorkingDirectory = 'C:\PALKA'
     $proc.StartInfo.UseShellExecute = $false
     $proc.StartInfo.RedirectStandardOutput = $true
@@ -1187,10 +1195,13 @@ try {
     $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit()
     $exitCode = $proc.ExitCode
-    if ($exitCode -eq 2 -and $stdout -match 'RESULT: STOPPED') {
+
+    $cliPass = ($exitCode -eq 2 -and $stdout -match 'RESULT:\s*STOPPED' -and $stdout -match 'MUTATION_STATE:\s*NOT_APPLIED')
+
+    if ($enginePass -and $cliPass) {
         Report-Pass 'T36' 'malformed JSON produces controlled STOPPED behavior and exit code 2'
     } else {
-        Report-Fail 'T36' 'malformed JSON produces controlled STOPPED behavior and exit code 2' "exitCode=$exitCode, out=$stdout"
+        Report-Fail 'T36' 'malformed JSON produces controlled STOPPED behavior and exit code 2' "enginePass=$enginePass (phase=$($res.failed_phase), reason=$($res.reason), count=$nativeCount), cliPass=$cliPass (exitCode=$exitCode, out=$stdout)"
     }
 } catch {
     Report-Fail 'T36' 'malformed JSON produces controlled STOPPED behavior and exit code 2' $_.Exception.Message
@@ -1205,7 +1216,7 @@ try {
     $repo = New-TestGitRepo 't37'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
     $srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $m.ManifestPath).Hash
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $destManifestPath = Join-Path $res.run_directory 'manifest.json'
     $destHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destManifestPath).Hash
     if ($res.result -eq 'COMPLETED' -and $srcHash -eq $destHash) {
@@ -1237,7 +1248,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'UNKNOWN' -and $res.reason -match 'builtin-scope-after') {
         Report-Pass 'T38' 'force scope-proof failure after launched mutation results in STOPPED, UNKNOWN'
     } else {
@@ -1267,7 +1278,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'UNKNOWN' -and $res.reason -match 'does not match target_branch') {
         Report-Pass 'T39' 'action leaving repo on different branch results in STOPPED, UNKNOWN'
     } else {
@@ -1354,7 +1365,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Invalid command id') {
         Report-Pass 'T41' 'command ID containing traversal/path syntax is rejected before launch'
     } else {
@@ -1384,7 +1395,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Forbidden git alias configuration') {
         Report-Pass 'T42' 'Git alias global-option bypass is rejected before launch'
     } else {
@@ -1403,7 +1414,7 @@ try {
 try {
     $repo = New-TestGitRepo 't43'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $hasFinalBranch = $false
@@ -1446,7 +1457,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $rec = $null
@@ -1483,7 +1494,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $hasFakeRecord = $false
@@ -1509,7 +1520,7 @@ try {
 try {
     $repo = New-TestGitRepo 't46'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
 
@@ -1576,7 +1587,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'APPLIED' -and $res.final_branch -eq 'feature-x') {
         Report-Pass 'T47' 'ALREADY_SATISFIED branch mismatch proceeds to action phase'
     } else {
@@ -1621,7 +1632,7 @@ try {
             }
         )
     }
-    $resA = Invoke-PalkaEngine -ManifestPath $mA.ManifestPath -OutputRoot $outputRoot -PassThru
+    $resA = Invoke-TestEngine -ManifestPath $mA.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # Part B: Policy violation in already_satisfied_checks -> STOPPED, no action runs
     $mB = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
@@ -1646,7 +1657,7 @@ try {
             }
         )
     }
-    $resB = Invoke-PalkaEngine -ManifestPath $mB.ManifestPath -OutputRoot $outputRoot -PassThru
+    $resB = Invoke-TestEngine -ManifestPath $mB.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # Part C: Launch failure in already_satisfied_checks -> STOPPED, no action runs
     $mC = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
@@ -1671,7 +1682,7 @@ try {
             }
         )
     }
-    $resC = Invoke-PalkaEngine -ManifestPath $mC.ManifestPath -OutputRoot $outputRoot -PassThru
+    $resC = Invoke-TestEngine -ManifestPath $mC.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $valA = & git -C $repo.RepoDir config test.t48.partA 2>$null
     $valB = & git -C $repo.RepoDir config test.t48.partB 2>$null
@@ -1700,7 +1711,7 @@ try {
     $repo = New-TestGitRepo 't49'
     $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
     $casedInsideRoot = $repo.RepoDir.ToLowerInvariant() + '\cased_artifacts'
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $casedInsideRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $casedInsideRoot -PassThru
     $createdInside = Test-Path $casedInsideRoot
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'must not be equal to or inside working_directory' -and -not $createdInside) {
         Report-Pass 'T49' 'OutputRoot inside repo using different path casing is rejected'
@@ -1733,7 +1744,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # Boolean in arguments
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
@@ -1748,13 +1759,13 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # Null in arguments
     $rawJson = [regex]::Replace((Get-Content -LiteralPath $m1.ManifestPath -Raw), '\[\s*123\s*\]', '[null]')
     $nullManifestPath = Join-Path $env:TEMP 't50-null-manifest.json'
     [System.IO.File]::WriteAllText($nullManifestPath, $rawJson, [System.Text.UTF8Encoding]::new($false))
-    $res3 = Invoke-PalkaEngine -ManifestPath $nullManifestPath -OutputRoot $outputRoot -PassThru
+    $res3 = Invoke-TestEngine -ManifestPath $nullManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.failed_phase -eq 'MANIFEST_VALIDATION' -and
         $res2.result -eq 'STOPPED' -and $res2.failed_phase -eq 'MANIFEST_VALIDATION' -and
@@ -1788,8 +1799,8 @@ try {
     [System.IO.File]::WriteAllText($pFalse, $strFalseJson, [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText($pTrue, $strTrueJson, [System.Text.UTF8Encoding]::new($false))
 
-    $resFalse = Invoke-PalkaEngine -ManifestPath $pFalse -OutputRoot $outputRoot -PassThru
-    $resTrue = Invoke-PalkaEngine -ManifestPath $pTrue -OutputRoot $outputRoot -PassThru
+    $resFalse = Invoke-TestEngine -ManifestPath $pFalse -OutputRoot $outputRoot -PassThru
+    $resTrue = Invoke-TestEngine -ManifestPath $pTrue -OutputRoot $outputRoot -PassThru
 
     if ($resFalse.result -eq 'STOPPED' -and $resFalse.reason -match 'branch_transition.allowed must be a strict JSON boolean' -and
         $resTrue.result -eq 'STOPPED' -and $resTrue.reason -match 'branch_transition.allowed must be a strict JSON boolean') {
@@ -1823,7 +1834,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match "Manifest command id cannot start with 'builtin-'") {
         Report-Pass 'T52' 'manifest command id beginning with builtin- is rejected before execution'
     } else {
@@ -1853,7 +1864,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $rec = $null
@@ -1907,7 +1918,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Scope violation: changed file .* matches forbidden pattern') {
         Report-Pass 'T54' 'rename scope parsing checks both source and destination paths'
     } else {
@@ -1941,7 +1952,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Scope violation') {
         Report-Pass 'T55' 'filename with leading or trailing space is not Trim-normalized'
     } else {
@@ -1971,7 +1982,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Forbidden force refspec in refresh_commands') {
         Report-Pass 'T56' 'refresh force refspec beginning with + is rejected before launch'
     } else {
@@ -2001,7 +2012,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'refresh_commands' = @(
@@ -2015,7 +2026,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'Forbidden force/prune flag in refresh_commands' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'Forbidden force/prune flag in refresh_commands') {
@@ -2049,7 +2060,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = @(
@@ -2063,7 +2074,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $scriptPath = Join-Path $repo.RepoDir 'my_script.ps1'
     [System.IO.File]::WriteAllText($scriptPath, 'param($param1) Write-Output "ok"', [System.Text.UTF8Encoding]::new($false))
@@ -2082,7 +2093,7 @@ try {
             }
         )
     }
-    $res3 = Invoke-PalkaEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res3 = Invoke-TestEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'PowerShell encoded command execution' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'PowerShell command string execution' -and
@@ -2111,7 +2122,7 @@ try {
             'origin/foo-bar' = 'ABSENT'
         }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
     $ids = [System.Collections.Generic.List[string]]::new()
@@ -2159,7 +2170,7 @@ try {
             throw "Injected post-start capture/engine failure for T60"
         }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru -TestPostStartHook $injectedHook
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru -TestPostStartHook $injectedHook
     $markerVal = & git -C $repo.RepoDir config test.t60.marker 2>$null
 
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
@@ -2207,7 +2218,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = @(
@@ -2224,7 +2235,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'Unknown property in expect object' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'expect.stdout_empty must be a strict JSON boolean') {
@@ -2250,19 +2261,19 @@ try {
     $m1 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = 'not-an-array'
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # authorized_paths as non-array
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_paths' = 'not-an-array'
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     # forbidden_paths containing integer element
     $m3 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'forbidden_paths' = @(999)
     }
-    $res3 = Invoke-PalkaEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res3 = Invoke-TestEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'Command section .* must be a JSON array' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match "Field 'authorized_paths' must be a JSON array" -and
@@ -2323,7 +2334,7 @@ try {
             throw "Injected post-start capture/engine failure for T64"
         }
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru -TestPostStartHook $injectedHook
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru -TestPostStartHook $injectedHook
 
     $jPath = Join-Path $res.run_directory 'commands.jsonl'
     $lines = Get-Content -LiteralPath $jPath
@@ -2368,7 +2379,7 @@ try {
             }
         )
     }
-    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res1 = Invoke-TestEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -PassThru
 
     $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
         'authorized_commands' = @(
@@ -2382,7 +2393,7 @@ try {
             }
         )
     }
-    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res2 = Invoke-TestEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -PassThru
 
     if ($res1.result -eq 'STOPPED' -and $res1.reason -match 'PowerShell command string execution' -and
         $res2.result -eq 'STOPPED' -and $res2.reason -match 'PowerShell command string execution') {
@@ -2453,7 +2464,7 @@ try {
             }
         )
     }
-    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
+    $res = Invoke-TestEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru
     if ($res.result -eq 'STOPPED' -and $res.reason -match 'Forbidden force refmap in refresh_commands') {
         Report-Pass 'T68' 'refresh --refmap=+... is rejected before launch'
     } else {
@@ -2461,6 +2472,547 @@ try {
     }
 } catch {
     Report-Fail 'T68' 'refresh --refmap=+... is rejected before launch' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T69 вЂ” missing AuthorizedManifestSha256 (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't69'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $nativeCount -eq 0) {
+        Report-Pass 'T69' 'missing AuthorizedManifestSha256 rejected with zero native launches'
+    } else {
+        Report-Fail 'T69' 'missing AuthorizedManifestSha256 rejected with zero native launches' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T69' 'missing AuthorizedManifestSha256 rejected with zero native launches' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T70 вЂ” empty digest (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't70'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 '' -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $nativeCount -eq 0) {
+        Report-Pass 'T70' 'empty digest rejected with zero native launches'
+    } else {
+        Report-Fail 'T70' 'empty digest rejected with zero native launches' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T70' 'empty digest rejected with zero native launches' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T71 вЂ” short/malformed lowercase digest (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't71'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 'abcd1234' -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $nativeCount -eq 0) {
+        Report-Pass 'T71' 'short/malformed lowercase digest rejected with zero native launches'
+    } else {
+        Report-Fail 'T71' 'short/malformed lowercase digest rejected with zero native launches' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T71' 'short/malformed lowercase digest rejected with zero native launches' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T72 — 64-character uppercase hex digest rejected without normalization (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't72'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $validSha = Get-TestManifestSha256 $m.ManifestPath
+    $upperSha = $validSha.ToUpperInvariant()
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $upperSha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $res.reason -notmatch 'MANIFEST_DIGEST_MISMATCH' -and $nativeCount -eq 0) {
+        Report-Pass 'T72' '64-character uppercase hex digest rejected without normalization'
+    } else {
+        Report-Fail 'T72' '64-character uppercase hex digest rejected without normalization' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) reason=$($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T72' '64-character uppercase hex digest rejected without normalization' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T73 вЂ” 64-character non-hex digest rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't73'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $nonHex = 'g' * 64
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $nonHex -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $nativeCount -eq 0) {
+        Report-Pass 'T73' '64-character non-hex digest rejected'
+    } else {
+        Report-Fail 'T73' '64-character non-hex digest rejected' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T73' '64-character non-hex digest rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T74 вЂ” well-formed but wrong digest (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't74'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $wrongSha = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $wrongSha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $res.reason -match 'MANIFEST_DIGEST_MISMATCH' -and $nativeCount -eq 0) {
+        Report-Pass 'T74' 'well-formed but wrong digest rejected before native execution'
+    } else {
+        Report-Fail 'T74' 'well-formed but wrong digest rejected before native execution' "got: $($res.result) $($res.mutation_state) $($res.failed_phase) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T74' 'well-formed but wrong digest rejected before native execution' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T75 вЂ” semantically equivalent JSON with different whitespace (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't75'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $origSha = Get-TestManifestSha256 $m.ManifestPath
+    # Modify whitespace without changing JSON semantics
+    $origText = [System.IO.File]::ReadAllText($m.ManifestPath)
+    $modifiedText = $origText + "  `n"
+    [System.IO.File]::WriteAllText($m.ManifestPath, $modifiedText, [System.Text.UTF8Encoding]::new($false))
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $origSha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $res.reason -match 'MANIFEST_DIGEST_MISMATCH' -and $nativeCount -eq 0) {
+        Report-Pass 'T75' 'semantically equivalent JSON with different whitespace rejected by byte digest barrier'
+    } else {
+        Report-Fail 'T75' 'semantically equivalent JSON with different whitespace rejected by byte digest barrier' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T75' 'semantically equivalent JSON with different whitespace rejected by byte digest barrier' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T76 вЂ” LF versus CRLF manifest bytes (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't76'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    # Save as strictly LF
+    $text = [System.IO.File]::ReadAllText($m.ManifestPath).Replace("`r`n", "`n")
+    [System.IO.File]::WriteAllText($m.ManifestPath, $text, [System.Text.UTF8Encoding]::new($false))
+    $lfSha = Get-TestManifestSha256 $m.ManifestPath
+    # Convert to CRLF
+    $crlfText = $text.Replace("`n", "`r`n")
+    [System.IO.File]::WriteAllText($m.ManifestPath, $crlfText, [System.Text.UTF8Encoding]::new($false))
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $lfSha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $res.reason -match 'MANIFEST_DIGEST_MISMATCH' -and $nativeCount -eq 0) {
+        Report-Pass 'T76' 'LF versus CRLF manifest bytes distinct authorization'
+    } else {
+        Report-Fail 'T76' 'LF versus CRLF manifest bytes distinct authorization' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T76' 'LF versus CRLF manifest bytes distinct authorization' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T77 вЂ” UTF-8 BOM versus no-BOM (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't77'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $noBomSha = Get-TestManifestSha256 $m.ManifestPath
+    # Prepend UTF-8 BOM bytes
+    $rawBytes = [System.IO.File]::ReadAllBytes($m.ManifestPath)
+    $bomBytes = [byte[]]@(0xEF, 0xBB, 0xBF) + $rawBytes
+    [System.IO.File]::WriteAllBytes($m.ManifestPath, $bomBytes)
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $noBomSha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_DIGEST_VALIDATION' -and $res.reason -match 'MANIFEST_DIGEST_MISMATCH' -and $nativeCount -eq 0) {
+        Report-Pass 'T77' 'UTF-8 BOM versus no-BOM distinct authorization'
+    } else {
+        Report-Fail 'T77' 'UTF-8 BOM versus no-BOM distinct authorization' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T77' 'UTF-8 BOM versus no-BOM distinct authorization' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T78 вЂ” correct digest with genuinely read-only manifest and explicitly empty stop_conditions (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't78'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'stop_conditions' = @()
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+    if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'NONE') {
+        Report-Pass 'T78' 'read-only manifest with explicitly empty stop_conditions succeeds'
+    } else {
+        Report-Fail 'T78' 'read-only manifest with explicitly empty stop_conditions succeeds' "got: $($res.result) $($res.mutation_state) $($res.reason)"
+    }
+} catch {
+    Report-Fail 'T78' 'read-only manifest with explicitly empty stop_conditions succeeds' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T79 вЂ” run-directory manifest.json is byte-for-byte identical to verified input and SHA-256 matches (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't79'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+    $runManifestPath = Join-Path $res.run_directory 'manifest.json'
+    $origBytes = [System.IO.File]::ReadAllBytes($m.ManifestPath)
+    $runBytes = [System.IO.File]::ReadAllBytes($runManifestPath)
+    $bytesIdentical = [System.Linq.Enumerable]::SequenceEqual($origBytes, $runBytes)
+    $runSha = Get-TestManifestSha256 $runManifestPath
+    if ($res.result -eq 'COMPLETED' -and $bytesIdentical -and $runSha -eq $sha) {
+        Report-Pass 'T79' 'run-directory manifest.json is byte-for-byte identical to verified input'
+    } else {
+        Report-Fail 'T79' 'run-directory manifest.json is byte-for-byte identical to verified input' "identical=$bytesIdentical, runSha=$runSha, sha=$sha"
+    }
+} catch {
+    Report-Fail 'T79' 'run-directory manifest.json is byte-for-byte identical to verified input' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T80 — artifact_profile = bootstrap_zip_v1 / case-variants rejected before native execution (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't80'
+    $m1 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'artifact_profile' = 'bootstrap_zip_v1'
+    }
+    $sha1 = Get-TestManifestSha256 $m1.ManifestPath
+    $nativeCount1 = 0
+    $hook1 = { param($cmd, $ph, $p) $script:nativeCount1++ }
+    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha1 -PassThru -TestPostStartHook $hook1
+
+    $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'artifact_profile' = 'phase_2a_run_directory_v0'
+    }
+    $sha2 = Get-TestManifestSha256 $m2.ManifestPath
+    $nativeCount2 = 0
+    $hook2 = { param($cmd, $ph, $p) $script:nativeCount2++ }
+    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha2 -PassThru -TestPostStartHook $hook2
+
+    $pass1 = ($res1.result -eq 'STOPPED' -and $res1.mutation_state -eq 'NOT_APPLIED' -and $res1.reason -match 'artifact_profile' -and $nativeCount1 -eq 0)
+    $pass2 = ($res2.result -eq 'STOPPED' -and $res2.mutation_state -eq 'NOT_APPLIED' -and $res2.reason -match 'artifact_profile' -and $nativeCount2 -eq 0)
+
+    if ($pass1 -and $pass2) {
+        Report-Pass 'T80' 'artifact_profile = bootstrap_zip_v1 and lowercase variant rejected before native execution'
+    } else {
+        Report-Fail 'T80' 'artifact_profile = bootstrap_zip_v1 and lowercase variant rejected before native execution' "pass1=$pass1, pass2=$pass2"
+    }
+} catch {
+    Report-Fail 'T80' 'artifact_profile = bootstrap_zip_v1 and lowercase variant rejected before native execution' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m1 -and (Test-Path $m1.ManifestPath)) { Remove-Item -Force $m1.ManifestPath }
+    if ($null -ne $m2 -and (Test-Path $m2.ManifestPath)) { Remove-Item -Force $m2.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T81 — mutating authorized command + empty stop_conditions rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't81'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'authorized_commands' = @(
+            [ordered]@{
+                'id' = 'mutating-cmd'
+                'executable' = 'git'
+                'arguments' = @('branch', 'newbranch')
+                'cwd' = $repo.RepoDir
+                'mutating' = $true
+                'expect' = [ordered]@{ 'exit_code' = 0 }
+            }
+        )
+        'stop_conditions' = @()
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.reason -match 'stop_conditions' -and $nativeCount -eq 0) {
+        Report-Pass 'T81' 'mutating authorized command + empty stop_conditions rejected'
+    } else {
+        Report-Fail 'T81' 'mutating authorized command + empty stop_conditions rejected' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T81' 'mutating authorized command + empty stop_conditions rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T82 — mutating manifest missing exactly one baseline stop-condition rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't82'
+    $partialBaseline = @(
+        'MANIFEST_DIGEST_MISMATCH',
+        'PRECONDITION_MISMATCH',
+        'REMOTE_REF_MISMATCH',
+        'POLICY_FAILURE',
+        'LAUNCH_FAILURE',
+        'ACTION_FAILURE',
+        'SCOPE_PROOF_FAILURE',
+        'POSTCONDITION_FAILURE'
+        # Omit FINAL_IDENTITY_PROOF_FAILURE
+    )
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'authorized_commands' = @(
+            [ordered]@{
+                'id' = 'mutating-cmd'
+                'executable' = 'git'
+                'arguments' = @('branch', 'newbranch')
+                'cwd' = $repo.RepoDir
+                'mutating' = $true
+                'expect' = [ordered]@{ 'exit_code' = 0 }
+            }
+        )
+        'stop_conditions' = $partialBaseline
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.reason -match 'missing mandatory baseline stop condition' -and $nativeCount -eq 0) {
+        Report-Pass 'T82' 'mutating manifest missing exactly one baseline stop-condition rejected'
+    } else {
+        Report-Fail 'T82' 'mutating manifest missing exactly one baseline stop-condition rejected' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T82' 'mutating manifest missing exactly one baseline stop-condition rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T83 — branch_transition.allowed=true with empty stop_conditions rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't83'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'target_branch' = 'new-branch'
+        'branch' = 'new-branch'
+        'branch_transition' = [ordered]@{
+            'allowed' = $true
+            'mode' = 'create'
+            'from' = 'main'
+            'to' = 'new-branch'
+        }
+        'stop_conditions' = @()
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.reason -match 'stop_conditions' -and $nativeCount -eq 0) {
+        Report-Pass 'T83' 'branch_transition.allowed=true with empty stop_conditions rejected'
+    } else {
+        Report-Fail 'T83' 'branch_transition.allowed=true with empty stop_conditions rejected' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T83' 'branch_transition.allowed=true with empty stop_conditions rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T84 — duplicate baseline stop-condition rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't84'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'stop_conditions' = @('POLICY_FAILURE', 'POLICY_FAILURE')
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $nativeCount = 0
+    $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru -TestPostStartHook $hook
+    if ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.reason -match 'Duplicate stop condition identifier' -and $nativeCount -eq 0) {
+        Report-Pass 'T84' 'duplicate baseline stop-condition rejected'
+    } else {
+        Report-Fail 'T84' 'duplicate baseline stop-condition rejected' "got: $($res.result) $($res.mutation_state) $($res.reason) count=$nativeCount"
+    }
+} catch {
+    Report-Fail 'T84' 'duplicate baseline stop-condition rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T85 — unknown stop-condition identifier and case-variants rejected (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't85'
+
+    # Subcase 1: Unknown custom condition
+    $m1 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'stop_conditions' = @('UNKNOWN_CUSTOM_CONDITION')
+    }
+    $sha1 = Get-TestManifestSha256 $m1.ManifestPath
+    $nativeCount1 = 0
+    $hook1 = { param($cmd, $ph, $p) $script:nativeCount1++ }
+    $res1 = Invoke-PalkaEngine -ManifestPath $m1.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha1 -PassThru -TestPostStartHook $hook1
+
+    # Subcase 2: Lowercase variant of valid condition
+    $m2 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'stop_conditions' = @('policy_failure')
+    }
+    $sha2 = Get-TestManifestSha256 $m2.ManifestPath
+    $nativeCount2 = 0
+    $hook2 = { param($cmd, $ph, $p) $script:nativeCount2++ }
+    $res2 = Invoke-PalkaEngine -ManifestPath $m2.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha2 -PassThru -TestPostStartHook $hook2
+
+    # Subcase 3: Full canonical baseline + lowercase variant
+    $canonicalPlusLower = @(
+        'MANIFEST_DIGEST_MISMATCH',
+        'PRECONDITION_MISMATCH',
+        'REMOTE_REF_MISMATCH',
+        'POLICY_FAILURE',
+        'LAUNCH_FAILURE',
+        'ACTION_FAILURE',
+        'SCOPE_PROOF_FAILURE',
+        'POSTCONDITION_FAILURE',
+        'FINAL_IDENTITY_PROOF_FAILURE',
+        'policy_failure'
+    )
+    $m3 = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'stop_conditions' = $canonicalPlusLower
+    }
+    $sha3 = Get-TestManifestSha256 $m3.ManifestPath
+    $nativeCount3 = 0
+    $hook3 = { param($cmd, $ph, $p) $script:nativeCount3++ }
+    $res3 = Invoke-PalkaEngine -ManifestPath $m3.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha3 -PassThru -TestPostStartHook $hook3
+
+    $pass1 = ($res1.result -eq 'STOPPED' -and $res1.mutation_state -eq 'NOT_APPLIED' -and $res1.reason -match 'Unknown stop condition identifier' -and $nativeCount1 -eq 0)
+    $pass2 = ($res2.result -eq 'STOPPED' -and $res2.mutation_state -eq 'NOT_APPLIED' -and $res2.reason -match 'Unknown stop condition identifier' -and $nativeCount2 -eq 0)
+    $pass3 = ($res3.result -eq 'STOPPED' -and $res3.mutation_state -eq 'NOT_APPLIED' -and $res3.reason -match 'Unknown stop condition identifier' -and $nativeCount3 -eq 0)
+
+    if ($pass1 -and $pass2 -and $pass3) {
+        Report-Pass 'T85' 'unknown stop-condition identifier and case-variants rejected'
+    } else {
+        Report-Fail 'T85' 'unknown stop-condition identifier and case-variants rejected' "pass1=$pass1, pass2=$pass2, pass3=$pass3"
+    }
+} catch {
+    Report-Fail 'T85' 'unknown stop-condition identifier and case-variants rejected' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m1 -and (Test-Path $m1.ManifestPath)) { Remove-Item -Force $m1.ManifestPath }
+    if ($null -ne $m2 -and (Test-Path $m2.ManifestPath)) { Remove-Item -Force $m2.ManifestPath }
+    if ($null -ne $m3 -and (Test-Path $m3.ManifestPath)) { Remove-Item -Force $m3.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T86 вЂ” CLI execution-envelope contract (DEC-003 Phase 2A.2)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't86'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $cliScript = Join-Path (Split-Path -Parent $scriptDir) 'Invoke-PalkaOperation.ps1'
+
+    # Subcase A: Missing digest via CLI produces structured STOPPED / NOT_APPLIED without interactive prompt
+    $pA = New-Object System.Diagnostics.Process
+    $pA.StartInfo.FileName = 'powershell.exe'
+    $pA.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$cliScript`" -ManifestPath `"$($m.ManifestPath)`" -OutputRoot `"$outputRoot`""
+    $pA.StartInfo.UseShellExecute = $false
+    $pA.StartInfo.RedirectStandardOutput = $true
+    $pA.StartInfo.RedirectStandardError = $true
+    $pA.Start() | Out-Null
+    $outA = $pA.StandardOutput.ReadToEnd()
+    $pA.WaitForExit()
+    $exitA = $pA.ExitCode
+
+    $subcaseAPass = ($exitA -ne 0 -and $outA -match 'RESULT:\s*STOPPED' -and $outA -match 'MUTATION_STATE:\s*NOT_APPLIED')
+
+    # Subcase B: Correct digest via CLI reaches engine and valid read-only operation completes
+    $shaB = Get-TestManifestSha256 $m.ManifestPath
+    $pB = New-Object System.Diagnostics.Process
+    $pB.StartInfo.FileName = 'powershell.exe'
+    $pB.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$cliScript`" -ManifestPath `"$($m.ManifestPath)`" -OutputRoot `"$outputRoot`" -AuthorizedManifestSha256 $shaB"
+    $pB.StartInfo.UseShellExecute = $false
+    $pB.StartInfo.RedirectStandardOutput = $true
+    $pB.StartInfo.RedirectStandardError = $true
+    $pB.Start() | Out-Null
+    $outB = $pB.StandardOutput.ReadToEnd()
+    $pB.WaitForExit()
+    $exitB = $pB.ExitCode
+
+    $subcaseBPass = ($exitB -eq 0 -and $outB -match 'RESULT:\s*COMPLETED' -and $outB -match 'MUTATION_STATE:\s*NONE')
+
+    if ($subcaseAPass -and $subcaseBPass) {
+        Report-Pass 'T86' 'CLI execution-envelope contract: missing digest stops gracefully, valid digest completes'
+    } else {
+        Report-Fail 'T86' 'CLI execution-envelope contract: missing digest stops gracefully, valid digest completes' "subcaseA=$subcaseAPass (exit=$exitA), subcaseB=$subcaseBPass (exit=$exitB)"
+    }
+} catch {
+    Report-Fail 'T86' 'CLI execution-envelope contract' $_.Exception.Message
 } finally {
     if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
     if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }

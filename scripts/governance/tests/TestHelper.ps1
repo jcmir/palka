@@ -1,9 +1,32 @@
 # TestHelper.ps1
-# Test helper library for Palka Governance Engine Self-Tests (DEC-003 Phase 2A R1)
+# Test helper library for Palka Governance Engine Self-Tests (DEC-003 Phase 2A.2)
 # FOR SELF-TEST HARNESS ONLY - NOT USED BY PRODUCTION ENGINE
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$PalkaTestBaselineStopConditions = @(
+    'MANIFEST_DIGEST_MISMATCH',
+    'PRECONDITION_MISMATCH',
+    'REMOTE_REF_MISMATCH',
+    'POLICY_FAILURE',
+    'LAUNCH_FAILURE',
+    'ACTION_FAILURE',
+    'SCOPE_PROOF_FAILURE',
+    'POSTCONDITION_FAILURE',
+    'FINAL_IDENTITY_PROOF_FAILURE'
+)
+
+function Get-TestManifestSha256 {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $sha256.ComputeHash($bytes)
+    return (($hashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
 
 function New-TestGitRepo {
     [CmdletBinding()]
@@ -133,8 +156,18 @@ function New-TestManifest {
         already_satisfied_checks = @()
         authorized_commands = @()
         required_postconditions = @()
-        artifact_profile = 'bootstrap_zip_v1'
-        stop_conditions = @()
+        artifact_profile = 'PHASE_2A_RUN_DIRECTORY_V0'
+        stop_conditions = @(
+            'MANIFEST_DIGEST_MISMATCH',
+            'PRECONDITION_MISMATCH',
+            'REMOTE_REF_MISMATCH',
+            'POLICY_FAILURE',
+            'LAUNCH_FAILURE',
+            'ACTION_FAILURE',
+            'SCOPE_PROOF_FAILURE',
+            'POSTCONDITION_FAILURE',
+            'FINAL_IDENTITY_PROOF_FAILURE'
+        )
     }
 
     foreach ($k in $CustomProperties.Keys) {
@@ -150,4 +183,28 @@ function New-TestManifest {
         ManifestPath = $manifestPath
         ManifestObject = ($json | ConvertFrom-Json)
     }
+}
+
+function Invoke-TestEngine {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputRoot,
+
+        [string]$AuthorizedManifestSha256 = $null,
+        [switch]$PassThru,
+        [scriptblock]$TestPostStartHook = $null
+    )
+
+    $digest = if ($PSBoundParameters.ContainsKey('AuthorizedManifestSha256')) {
+        $AuthorizedManifestSha256
+    }
+    else {
+        Get-TestManifestSha256 $ManifestPath
+    }
+
+    Invoke-PalkaEngine -ManifestPath $ManifestPath -OutputRoot $OutputRoot -AuthorizedManifestSha256 $digest -PassThru:$PassThru -TestPostStartHook $TestPostStartHook
 }

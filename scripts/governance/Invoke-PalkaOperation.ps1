@@ -1,5 +1,5 @@
 # Invoke-PalkaOperation.ps1
-# CLI entry point for Palka Governance Execution Engine (DEC-003 Phase 2A R2)
+# CLI entry point for Palka Governance Execution Engine (DEC-003 Phase 2A.2)
 
 [CmdletBinding()]
 param (
@@ -8,6 +8,9 @@ param (
 
     [Parameter(Mandatory = $true)]
     [string]$OutputRoot,
+
+    [Parameter(Mandatory = $false)]
+    [string]$AuthorizedManifestSha256 = $null,
 
     [switch]$PassThru
 )
@@ -21,7 +24,7 @@ try {
 
     Import-Module $modulePath -Force
 
-    $summary = Invoke-PalkaEngine -ManifestPath $ManifestPath -OutputRoot $OutputRoot -PassThru
+    $summary = Invoke-PalkaEngine -ManifestPath $ManifestPath -OutputRoot $OutputRoot -AuthorizedManifestSha256 $AuthorizedManifestSha256 -PassThru
 
     Write-Host "RESULT: $($summary.result)"
     Write-Host "MUTATION_STATE: $($summary.mutation_state)"
@@ -55,7 +58,7 @@ try {
 }
 catch {
     Write-Host "RESULT: STOPPED"
-    Write-Host "MUTATION_STATE: NONE"
+    Write-Host "MUTATION_STATE: NOT_APPLIED"
     Write-Host "OPERATION_ID: INVALID-MANIFEST"
     Write-Host "RUN_DIRECTORY: <none>"
     Write-Host "SUMMARY: <none>"

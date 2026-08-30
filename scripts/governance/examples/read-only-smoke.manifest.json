@@ -71,6 +71,16 @@
     }
   ],
   "required_postconditions": [],
-  "artifact_profile": "bootstrap_zip_v1",
-  "stop_conditions": []
+  "artifact_profile": "PHASE_2A_RUN_DIRECTORY_V0",
+  "stop_conditions": [
+    "MANIFEST_DIGEST_MISMATCH",
+    "PRECONDITION_MISMATCH",
+    "REMOTE_REF_MISMATCH",
+    "POLICY_FAILURE",
+    "LAUNCH_FAILURE",
+    "ACTION_FAILURE",
+    "SCOPE_PROOF_FAILURE",
+    "POSTCONDITION_FAILURE",
+    "FINAL_IDENTITY_PROOF_FAILURE"
+  ]
 }
