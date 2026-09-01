@@ -6,3 +6,5 @@ edition.workspace = true
 [dependencies]
 palka-core = { path = "../core" }
 palka-windows-platform = { path = "../windows-platform" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
