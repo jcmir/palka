@@ -4,6 +4,20 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Phase 2A Baseline Stop Conditions
+$PalkaBaselineStopConditions = @(
+    'MANIFEST_DIGEST_MISMATCH',
+    'PRECONDITION_MISMATCH',
+    'REMOTE_REF_MISMATCH',
+    'POLICY_FAILURE',
+    'LAUNCH_FAILURE',
+    'ACTION_FAILURE',
+    'SCOPE_PROOF_FAILURE',
+    'POSTCONDITION_FAILURE',
+    'FINAL_IDENTITY_PROOF_FAILURE'
+)
+$PalkaBaselineStopConditionsSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$PalkaBaselineStopConditions, [System.StringComparer]::Ordinal)
+
 # R2-02: Deterministic Failure Exception Class
 class PalkaEngineException : System.Exception {
     [string]$FailureKind
@@ -466,6 +480,30 @@ function Test-PalkaManifestStructure {
         throw [PalkaEngineException]::new('ENGINE_FAILURE', "Unsupported manifest schema: '$($ManifestObject.schema)'")
     }
 
+    if (-not [string]::Equals($ManifestObject.artifact_profile, 'PHASE_2A_RUN_DIRECTORY_V0', [System.StringComparison]::Ordinal)) {
+        throw [PalkaEngineException]::new('ENGINE_FAILURE', "artifact_profile must be 'PHASE_2A_RUN_DIRECTORY_V0', got '$($ManifestObject.artifact_profile)'")
+    }
+
+    # Validate stop_conditions array structure
+    $sc = $ManifestObject.stop_conditions
+    if ($null -eq $sc -or ($sc -isnot [System.Array] -and $sc -isnot [System.Collections.IList])) {
+        throw [PalkaEngineException]::new('ENGINE_FAILURE', 'Field stop_conditions must be a JSON array')
+    }
+
+    $seenSc = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($item in $sc) {
+        if ($null -eq $item -or $item -isnot [string]) {
+            throw [PalkaEngineException]::new('ENGINE_FAILURE', 'Field stop_conditions must contain only JSON strings')
+        }
+        if (-not $PalkaBaselineStopConditionsSet.Contains($item)) {
+            throw [PalkaEngineException]::new('ENGINE_FAILURE', "Unknown stop condition identifier in stop_conditions: '$item'")
+        }
+        if ($seenSc.Contains($item)) {
+            throw [PalkaEngineException]::new('ENGINE_FAILURE', "Duplicate stop condition identifier in stop_conditions: '$item'")
+        }
+        $seenSc.Add($item) | Out-Null
+    }
+
     # Validate operation_id
     if (-not (Test-PalkaSafeIdentifier $ManifestObject.operation_id)) {
         throw [PalkaEngineException]::new('ENGINE_FAILURE', "Invalid operation_id: '$($ManifestObject.operation_id)' (must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and not be relative path navigation)")
@@ -707,6 +745,28 @@ function Test-PalkaManifestStructure {
             }
         }
     }
+
+    # Mutating manifest stop_conditions requirement
+    $isMutating = ($null -ne $ManifestObject.branch_transition -and $ManifestObject.branch_transition.allowed -eq $true)
+    if (-not $isMutating -and $null -ne $ManifestObject.authorized_commands) {
+        foreach ($cmd in $ManifestObject.authorized_commands) {
+            if ($cmd.mutating -eq $true) {
+                $isMutating = $true
+                break
+            }
+        }
+    }
+
+    if ($isMutating) {
+        if ($sc.Count -eq 0) {
+            throw [PalkaEngineException]::new('ENGINE_FAILURE', 'Mutating manifest requires non-empty stop_conditions containing complete baseline set')
+        }
+        foreach ($baseSc in $PalkaBaselineStopConditions) {
+            if (-not $seenSc.Contains($baseSc)) {
+                throw [PalkaEngineException]::new('ENGINE_FAILURE', "Mutating manifest missing mandatory baseline stop condition: '$baseSc'")
+            }
+        }
+    }
 }
 
 function Invoke-PalkaNativeProcess {
@@ -853,6 +913,9 @@ function Invoke-PalkaEngine {
         [Parameter(Mandatory = $true)]
         [string]$OutputRoot,
 
+        [Parameter(Mandatory = $false)]
+        [string]$AuthorizedManifestSha256 = $null,
+
         [switch]$PassThru,
 
         # Internal test-only hook (R3-03); disabled in production defaults
@@ -864,7 +927,7 @@ function Invoke-PalkaEngine {
 
     $engineState = [PSCustomObject]@{
         Sequence = 0
-        MutationState = 'NONE'
+        MutationState = 'NOT_APPLIED'
         ProvenBranch = $null
         ProvenHead = $null
     }
@@ -872,7 +935,7 @@ function Invoke-PalkaEngine {
     # Defaults
     $operationId = 'INVALID-MANIFEST'
     $result = 'STOPPED'
-    $failedPhase = 'MANIFEST_READ'
+    $failedPhase = 'MANIFEST_DIGEST_VALIDATION'
     $failedCommandId = $null
     $failureReason = $null
     $manifest = $null
@@ -1004,13 +1067,27 @@ function Invoke-PalkaEngine {
     }
 
     try {
-        # Phase 0: Read Manifest and Strict UTF-8 decode
-        $failedPhase = 'MANIFEST_READ'
+        # Phase 0: Authorized Manifest Digest Barrier
+        $failedPhase = 'MANIFEST_DIGEST_VALIDATION'
+        if ($null -eq $AuthorizedManifestSha256 -or $AuthorizedManifestSha256.Length -ne 64 -or $AuthorizedManifestSha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw [PalkaEngineException]::new('POLICY_FAILURE', $null, 'MANIFEST_DIGEST_VALIDATION', "AuthorizedManifestSha256 must be exactly 64 lowercase hexadecimal characters")
+        }
+
         if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-            throw [PalkaEngineException]::new('ENGINE_FAILURE', "Manifest file does not exist: '$ManifestPath'")
+            throw [PalkaEngineException]::new('ENGINE_FAILURE', $null, 'MANIFEST_DIGEST_VALIDATION', "Manifest file does not exist: '$ManifestPath'")
         }
 
         $rawManifestBytes = [System.IO.File]::ReadAllBytes($ManifestPath)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hashBytes = $sha256.ComputeHash($rawManifestBytes)
+        $calculatedSha = ($hashBytes | ForEach-Object { $_.ToString('x2') }) -join ''
+
+        if (-not [string]::Equals($calculatedSha, $AuthorizedManifestSha256, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('POLICY_FAILURE', $null, 'MANIFEST_DIGEST_VALIDATION', "MANIFEST_DIGEST_MISMATCH: Calculated digest '$calculatedSha' does not match authorized digest '$AuthorizedManifestSha256'")
+        }
+
+        # Phase 0.5: Strict UTF-8 decode & JSON Parsing
+        $failedPhase = 'MANIFEST_READ'
         $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
         $manifestJsonText = $utf8Strict.GetString($rawManifestBytes)
 
@@ -1050,7 +1127,7 @@ function Invoke-PalkaEngine {
         $commandsJournalPath = Join-Path $runDir 'commands.jsonl'
         $summaryPath = Join-Path $runDir 'summary.json'
 
-        # Determine initial mutation state
+        # Determine initial mutation state after manifest verification
         $hasMutatingAuthorizedCommand = $false
         if ($null -ne $manifest.authorized_commands) {
             foreach ($ac in $manifest.authorized_commands) {
@@ -1060,7 +1137,8 @@ function Invoke-PalkaEngine {
                 }
             }
         }
-        if ($hasMutatingAuthorizedCommand) {
+        $isPotentiallyMutating = ($hasMutatingAuthorizedCommand -or ($null -ne $manifest.branch_transition -and $manifest.branch_transition.allowed -eq $true))
+        if ($isPotentiallyMutating) {
             $engineState.MutationState = 'NOT_APPLIED'
         }
         else {
@@ -1286,7 +1364,7 @@ function Invoke-PalkaEngine {
 
             # All phases completed successfully
             $result = 'COMPLETED'
-            if ($hasMutatingAuthorizedCommand) {
+            if ($isPotentiallyMutating) {
                 $engineState.MutationState = 'APPLIED'
             }
             else {
