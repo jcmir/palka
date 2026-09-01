@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = (Resolve-Path (Join-Path $scriptDir '..\..\..')).Path
 $govModule = Join-Path (Split-Path -Parent $scriptDir) 'PalkaGovernance.psm1'
 $helperScript = Join-Path $scriptDir 'TestHelper.ps1'
 
@@ -1184,10 +1185,11 @@ try {
 
     $enginePass = ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED' -and $res.failed_phase -eq 'MANIFEST_READ' -and $res.reason -match 'Malformed JSON' -and $nativeCount -eq 0)
 
+    $invokeScriptPath = Join-Path $repoRoot 'scripts\governance\Invoke-PalkaOperation.ps1'
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo.FileName = 'powershell.exe'
-    $proc.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File C:\PALKA\scripts\governance\Invoke-PalkaOperation.ps1 -ManifestPath `"$malformedPath`" -OutputRoot `"$outputRoot`" -AuthorizedManifestSha256 $malformedSha"
-    $proc.StartInfo.WorkingDirectory = 'C:\PALKA'
+    $proc.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$invokeScriptPath`" -ManifestPath `"$malformedPath`" -OutputRoot `"$outputRoot`" -AuthorizedManifestSha256 $malformedSha"
+    $proc.StartInfo.WorkingDirectory = $repoRoot
     $proc.StartInfo.UseShellExecute = $false
     $proc.StartInfo.RedirectStandardOutput = $true
     $proc.StartInfo.RedirectStandardError = $true
@@ -2295,7 +2297,7 @@ try {
 # T63 — checked-in smoke example is a non-executable template (R3-01)
 # ----------------------------------------------------
 try {
-    $examplePath = 'C:\PALKA\scripts\governance\examples\read-only-smoke.manifest.json'
+    $examplePath = Join-Path $repoRoot 'scripts\governance\examples\read-only-smoke.manifest.json'
     $exampleContent = [System.IO.File]::ReadAllText($examplePath)
     $hasHeadPlaceholder = $exampleContent.Contains('<40-hex-head-sha>')
     $hasBasePlaceholder = $exampleContent.Contains('<40-hex-base-sha>')
