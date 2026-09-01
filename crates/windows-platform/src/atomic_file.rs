@@ -71,7 +71,7 @@ impl From<std::io::Error> for AtomicPublishError {
 pub fn atomic_publish_file(temp_path: &Path, target_path: &Path) -> Result<(), AtomicPublishError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
-        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACE_FILE_FLAGS,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW,
     };
     use windows::core::PCWSTR;
 
