@@ -65,13 +65,13 @@ impl From<std::io::Error> for AtomicPublishError {
 /// Atomically publishes `temp_path` to `target_path` on Windows.
 ///
 /// Both `temp_path` and `target_path` must reside in the same parent directory.
-/// If `target_path` already exists, `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH` is used.
+/// If `target_path` already exists, `ReplaceFileW` with zero replace flags is used.
 /// If `target_path` does not exist, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is used.
 #[cfg(windows)]
 pub fn atomic_publish_file(temp_path: &Path, target_path: &Path) -> Result<(), AtomicPublishError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACE_FILE_FLAGS,
     };
     use windows::core::PCWSTR;
 
@@ -95,13 +95,13 @@ pub fn atomic_publish_file(temp_path: &Path, target_path: &Path) -> Result<(), A
     let target_pcwstr = PCWSTR(target_wide.as_ptr());
 
     if target_path.exists() {
-        // Target exists -> atomically replace target with temp
+        // Target exists -> atomically replace target with temp using zero flags
         let res = unsafe {
             ReplaceFileW(
                 target_pcwstr,
                 temp_pcwstr,
                 PCWSTR::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                REPLACE_FILE_FLAGS(0),
                 None,
                 None,
             )
@@ -214,6 +214,29 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&target_path).unwrap(),
             "new state content"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_existing_target() {
+        let dir = setup_test_dir("replacement_fail");
+        let temp_path = dir.join(".nonexistent.tmp");
+        let target_path = dir.join("state.json");
+
+        fs::write(&target_path, "OLD canonical content").unwrap();
+
+        assert!(!temp_path.exists());
+        assert!(target_path.exists());
+
+        let res = atomic_publish_file(&temp_path, &target_path);
+        assert!(res.is_err());
+
+        assert!(target_path.exists());
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "OLD canonical content"
         );
 
         let _ = fs::remove_dir_all(&dir);

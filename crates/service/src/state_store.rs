@@ -90,13 +90,16 @@ impl StateFileStore {
     /// If the canonical file does not exist, returns `StateStoreError::MissingCanonical`.
     /// Does not fall back to temporary candidate files and never creates a default state.
     pub fn load(&self) -> Result<PersistentState, StateStoreError> {
-        if !self.canonical_path.exists() {
-            return Err(StateStoreError::MissingCanonical(
-                self.canonical_path.clone(),
-            ));
-        }
+        let bytes = match std::fs::read(&self.canonical_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StateStoreError::MissingCanonical(
+                    self.canonical_path.clone(),
+                ));
+            }
+            Err(err) => return Err(StateStoreError::Io(err)),
+        };
 
-        let bytes = std::fs::read(&self.canonical_path)?;
         let state = decode_state_json_bytes(&bytes)?;
         Ok(state)
     }
