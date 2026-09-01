@@ -45,6 +45,20 @@ try {
         Write-Host "SUMMARY: <none>"
     }
 
+    if ($null -ne $summary.artifact_path -and (Test-Path -LiteralPath $summary.artifact_path)) {
+        Write-Host "ARTIFACT: $($summary.artifact_path)"
+        if ($null -ne $summary.artifact_sha256 -and $summary.artifact_sha256.Length -gt 0) {
+            Write-Host "ARTIFACT_SHA256: $($summary.artifact_sha256)"
+        }
+        else {
+            Write-Host "ARTIFACT_SHA256: <none>"
+        }
+    }
+    else {
+        Write-Host "ARTIFACT: <none>"
+        Write-Host "ARTIFACT_SHA256: <none>"
+    }
+
     if ($PassThru) {
         $summary
     }
@@ -62,6 +76,8 @@ catch {
     Write-Host "OPERATION_ID: INVALID-MANIFEST"
     Write-Host "RUN_DIRECTORY: <none>"
     Write-Host "SUMMARY: <none>"
+    Write-Host "ARTIFACT: <none>"
+    Write-Host "ARTIFACT_SHA256: <none>"
     Write-Host "REASON: $($_.Exception.Message)"
     exit 2
 }
