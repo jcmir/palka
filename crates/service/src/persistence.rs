@@ -4,7 +4,7 @@ use palka_core::{
     ActionExecutionState, ActionKind, ChatMessage, Deadline, DeliveryStatus, DesiredInternetState,
     Initiator, MessageId, MessageSender, ScheduledAction, TimerId, UtcDateTime, WarningThreshold,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -132,12 +132,21 @@ impl std::error::Error for PersistenceError {}
 // Strict DTO definitions for schema v1
 // ---------------------------------------------------------------------------
 
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateFileV1Dto {
     schema_version: u32,
     desired_internet_state: DesiredInternetStateDto,
     active_actions: Vec<ScheduledActionDto>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     internet_retry: Option<InternetRetryDto>,
     telegram_outbox: Vec<TelegramOutboxEntryDto>,
 }
@@ -187,16 +196,14 @@ enum WarningThresholdDto {
 enum ActionExecutionStateDto {
     Pending {},
     Executing {},
-    Completed {},
     Failed { reason: String },
-    Missed {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InternetRetryDto {
     attempt_count: u32,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     last_error: Option<String>,
 }
 
@@ -206,7 +213,7 @@ struct TelegramOutboxEntryDto {
     entry_id: String,
     payload: TelegramPayloadDto,
     attempt_count: u32,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     last_error: Option<String>,
 }
 
@@ -230,15 +237,11 @@ struct ChatMessageDto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum MessageSenderDto {
     Child,
-    Parent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum DeliveryStatusDto {
-    Pending,
     AcceptedByService,
-    AcceptedByTelegram,
-    DeliveredToTray,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,11 +357,9 @@ impl TryFrom<StateFileV1Dto> for PersistentState {
             let execution_state = match action_dto.execution_state {
                 ActionExecutionStateDto::Pending {} => ActionExecutionState::Pending,
                 ActionExecutionStateDto::Executing {} => ActionExecutionState::Executing,
-                ActionExecutionStateDto::Completed {} => ActionExecutionState::Completed,
                 ActionExecutionStateDto::Failed { reason } => {
                     ActionExecutionState::Failed { reason }
                 }
-                ActionExecutionStateDto::Missed {} => ActionExecutionState::Missed,
             };
 
             active_actions.push(ScheduledAction {
@@ -394,13 +395,9 @@ impl TryFrom<StateFileV1Dto> for PersistentState {
                     let msg_id = MessageId(msg_id_bytes);
                     let sender = match msg_dto.sender {
                         MessageSenderDto::Child => MessageSender::Child,
-                        MessageSenderDto::Parent => MessageSender::Parent,
                     };
                     let delivery_status = match msg_dto.delivery_status {
-                        DeliveryStatusDto::Pending => DeliveryStatus::Pending,
                         DeliveryStatusDto::AcceptedByService => DeliveryStatus::AcceptedByService,
-                        DeliveryStatusDto::AcceptedByTelegram => DeliveryStatus::AcceptedByTelegram,
-                        DeliveryStatusDto::DeliveredToTray => DeliveryStatus::DeliveredToTray,
                     };
                     TelegramPayload::Chat {
                         message: ChatMessage {
@@ -434,15 +431,22 @@ impl TryFrom<StateFileV1Dto> for PersistentState {
     }
 }
 
-impl From<&PersistentState> for StateFileV1Dto {
-    fn from(state: &PersistentState) -> Self {
+impl TryFrom<&PersistentState> for StateFileV1Dto {
+    type Error = PersistenceError;
+
+    fn try_from(state: &PersistentState) -> Result<Self, Self::Error> {
         let desired_internet_state = match state.desired_internet_state {
             DesiredInternetState::Unrestricted => DesiredInternetStateDto::Unrestricted,
             DesiredInternetState::Blocked => DesiredInternetStateDto::Blocked,
         };
 
+        let mut seen_timer_ids = HashSet::new();
         let mut active_actions = Vec::with_capacity(state.active_actions.len());
         for action in &state.active_actions {
+            if !seen_timer_ids.insert(action.id) {
+                return Err(PersistenceError::DuplicateTimerId(action.id));
+            }
+
             let action_kind = match action.action_kind {
                 ActionKind::BlockInternet => ActionKindDto::BlockInternet,
                 ActionKind::ShutdownComputer => ActionKindDto::ShutdownComputer,
@@ -454,7 +458,14 @@ impl From<&PersistentState> for StateFileV1Dto {
             };
 
             let mut emitted_thresholds = Vec::new();
+            let mut seen_thresholds = HashSet::new();
             for th in &action.emitted_thresholds {
+                if !seen_thresholds.insert(*th) {
+                    return Err(PersistenceError::DuplicateWarningThreshold {
+                        timer_id: action.id,
+                        threshold: *th,
+                    });
+                }
                 emitted_thresholds.push(match th {
                     WarningThreshold::M60 => WarningThresholdDto::M60,
                     WarningThreshold::M30 => WarningThresholdDto::M30,
@@ -467,11 +478,21 @@ impl From<&PersistentState> for StateFileV1Dto {
             let execution_state = match &action.execution_state {
                 ActionExecutionState::Pending => ActionExecutionStateDto::Pending {},
                 ActionExecutionState::Executing => ActionExecutionStateDto::Executing {},
-                ActionExecutionState::Completed => ActionExecutionStateDto::Completed {},
                 ActionExecutionState::Failed { reason } => ActionExecutionStateDto::Failed {
                     reason: reason.clone(),
                 },
-                ActionExecutionState::Missed => ActionExecutionStateDto::Missed {},
+                ActionExecutionState::Completed => {
+                    return Err(PersistenceError::Validation(format!(
+                        "Terminal state Completed is prohibited in active_actions for action {}",
+                        format_128bit_id_hex(&action.id.0)
+                    )));
+                }
+                ActionExecutionState::Missed => {
+                    return Err(PersistenceError::Validation(format!(
+                        "Terminal state Missed is prohibited in active_actions for action {}",
+                        format_128bit_id_hex(&action.id.0)
+                    )));
+                }
             };
 
             active_actions.push(ScheduledActionDto {
@@ -490,20 +511,33 @@ impl From<&PersistentState> for StateFileV1Dto {
             last_error: r.last_error.clone(),
         });
 
+        let mut seen_outbox_ids = HashSet::new();
         let mut telegram_outbox = Vec::with_capacity(state.telegram_outbox.len());
         for entry in &state.telegram_outbox {
+            if !seen_outbox_ids.insert(entry.entry_id) {
+                return Err(PersistenceError::DuplicateOutboxEntryId(entry.entry_id));
+            }
+
             let payload = match &entry.payload {
                 TelegramPayload::Chat { message } => {
                     let sender = match message.sender {
                         MessageSender::Child => MessageSenderDto::Child,
-                        MessageSender::Parent => MessageSenderDto::Parent,
+                        MessageSender::Parent => {
+                            return Err(PersistenceError::Validation(format!(
+                                "Prohibited Parent sender in telegram_outbox ChatMessage {}",
+                                format_128bit_id_hex(&message.id.0)
+                            )));
+                        }
                     };
-                    let delivery_status = match message.delivery_status {
-                        DeliveryStatus::Pending => DeliveryStatusDto::Pending,
+                    let delivery_status = match &message.delivery_status {
                         DeliveryStatus::AcceptedByService => DeliveryStatusDto::AcceptedByService,
-                        DeliveryStatus::AcceptedByTelegram => DeliveryStatusDto::AcceptedByTelegram,
-                        DeliveryStatus::DeliveredToTray => DeliveryStatusDto::DeliveredToTray,
-                        DeliveryStatus::Failed { .. } => DeliveryStatusDto::Pending,
+                        other => {
+                            return Err(PersistenceError::Validation(format!(
+                                "Invalid delivery_status {:?} in telegram_outbox ChatMessage {} (must be AcceptedByService)",
+                                other,
+                                format_128bit_id_hex(&message.id.0)
+                            )));
+                        }
                     };
                     TelegramPayloadDto::Chat {
                         message: ChatMessageDto {
@@ -528,13 +562,13 @@ impl From<&PersistentState> for StateFileV1Dto {
             });
         }
 
-        StateFileV1Dto {
+        Ok(StateFileV1Dto {
             schema_version: STATE_SCHEMA_VERSION_V1,
             desired_internet_state,
             active_actions,
             internet_retry,
             telegram_outbox,
-        }
+        })
     }
 }
 
@@ -558,13 +592,13 @@ pub fn decode_state_json_bytes(bytes: &[u8]) -> Result<PersistentState, Persiste
 
 /// Encodes `PersistentState` into a compact UTF-8 JSON string.
 pub fn encode_state_json(state: &PersistentState) -> Result<String, PersistenceError> {
-    let dto = StateFileV1Dto::from(state);
+    let dto = StateFileV1Dto::try_from(state)?;
     serde_json::to_string(&dto).map_err(|e| PersistenceError::Json(e.to_string()))
 }
 
 /// Encodes `PersistentState` into a formatted (pretty) UTF-8 JSON string.
 pub fn encode_state_json_pretty(state: &PersistentState) -> Result<String, PersistenceError> {
-    let dto = StateFileV1Dto::from(state);
+    let dto = StateFileV1Dto::try_from(state)?;
     serde_json::to_string_pretty(&dto).map_err(|e| PersistenceError::Json(e.to_string()))
 }
 
@@ -999,5 +1033,503 @@ mod tests {
         let encoded = encode_state_json(&state).unwrap();
         let decoded = decode_state_json(&encoded).unwrap();
         assert_eq!(state, decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for strict contract & validation rules
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_completed_active_action_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Blocked",
+            "active_actions": [
+                {
+                    "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6071",
+                    "action_kind": "BlockInternet",
+                    "deadline": 1700000000000,
+                    "created_at": 1699996400000,
+                    "created_by": { "kind": "ParentLocalPin" },
+                    "emitted_thresholds": [],
+                    "execution_state": { "kind": "Completed" }
+                }
+            ],
+            "internet_retry": null,
+            "telegram_outbox": []
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `Completed`"))
+            }
+            other => panic!("expected unknown variant Completed error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_missed_active_action_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Blocked",
+            "active_actions": [
+                {
+                    "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6071",
+                    "action_kind": "ShutdownComputer",
+                    "deadline": 1700000000000,
+                    "created_at": 1699996400000,
+                    "created_by": { "kind": "ParentLocalPin" },
+                    "emitted_thresholds": [],
+                    "execution_state": { "kind": "Missed" }
+                }
+            ],
+            "internet_retry": null,
+            "telegram_outbox": []
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `Missed`"))
+            }
+            other => panic!("expected unknown variant Missed error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_completed_active_action_rejected() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Blocked,
+            active_actions: vec![ScheduledAction {
+                id: sample_timer_id(1),
+                action_kind: ActionKind::BlockInternet,
+                deadline: Deadline(UtcDateTime(1700000000000)),
+                created_at: UtcDateTime(1699996400000),
+                created_by: Initiator::ParentLocalPin,
+                emitted_thresholds: HashSet::new(),
+                execution_state: ActionExecutionState::Completed,
+            }],
+            internet_retry: None,
+            telegram_outbox: vec![],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        match err {
+            PersistenceError::Validation(msg) => {
+                assert!(msg.contains("Terminal state Completed is prohibited"))
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_missed_active_action_rejected() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Blocked,
+            active_actions: vec![ScheduledAction {
+                id: sample_timer_id(1),
+                action_kind: ActionKind::ShutdownComputer,
+                deadline: Deadline(UtcDateTime(1700000000000)),
+                created_at: UtcDateTime(1699996400000),
+                created_by: Initiator::ParentLocalPin,
+                emitted_thresholds: HashSet::new(),
+                execution_state: ActionExecutionState::Missed,
+            }],
+            internet_retry: None,
+            telegram_outbox: vec![],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        match err {
+            PersistenceError::Validation(msg) => {
+                assert!(msg.contains("Terminal state Missed is prohibited"))
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_parent_chat_in_telegram_outbox_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "Chat",
+                        "message": {
+                            "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6072",
+                            "sender": "Parent",
+                            "text": "Hello child",
+                            "timestamp": 1700000000000,
+                            "delivery_status": "AcceptedByService"
+                        }
+                    },
+                    "attempt_count": 0,
+                    "last_error": null
+                }
+            ]
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `Parent`"))
+            }
+            other => panic!("expected unknown variant Parent error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_parent_chat_rejected() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: vec![],
+            internet_retry: None,
+            telegram_outbox: vec![TelegramOutboxEntry {
+                entry_id: sample_outbox_id(1),
+                payload: TelegramPayload::Chat {
+                    message: ChatMessage {
+                        id: MessageId([1; 16]),
+                        sender: MessageSender::Parent,
+                        text: "Disallowed outbound parent message".to_string(),
+                        timestamp: UtcDateTime(1700000000000),
+                        delivery_status: DeliveryStatus::AcceptedByService,
+                    },
+                },
+                attempt_count: 0,
+                last_error: None,
+            }],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        match err {
+            PersistenceError::Validation(msg) => {
+                assert!(msg.contains("Prohibited Parent sender in telegram_outbox"))
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pending_chat_delivery_status_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "Chat",
+                        "message": {
+                            "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6072",
+                            "sender": "Child",
+                            "text": "Hello",
+                            "timestamp": 1700000000000,
+                            "delivery_status": "Pending"
+                        }
+                    },
+                    "attempt_count": 0,
+                    "last_error": null
+                }
+            ]
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `Pending`"))
+            }
+            other => panic!("expected unknown variant Pending error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_accepted_by_telegram_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "Chat",
+                        "message": {
+                            "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6072",
+                            "sender": "Child",
+                            "text": "Hello",
+                            "timestamp": 1700000000000,
+                            "delivery_status": "AcceptedByTelegram"
+                        }
+                    },
+                    "attempt_count": 0,
+                    "last_error": null
+                }
+            ]
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `AcceptedByTelegram`"))
+            }
+            other => panic!("expected unknown variant AcceptedByTelegram error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_delivered_to_tray_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "Chat",
+                        "message": {
+                            "id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6072",
+                            "sender": "Child",
+                            "text": "Hello",
+                            "timestamp": 1700000000000,
+                            "delivery_status": "DeliveredToTray"
+                        }
+                    },
+                    "attempt_count": 0,
+                    "last_error": null
+                }
+            ]
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("unknown variant `DeliveredToTray`"))
+            }
+            other => panic!("expected unknown variant DeliveredToTray error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_failed_delivery_status_rejected_and_never_converted_to_pending() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: vec![],
+            internet_retry: None,
+            telegram_outbox: vec![TelegramOutboxEntry {
+                entry_id: sample_outbox_id(1),
+                payload: TelegramPayload::Chat {
+                    message: ChatMessage {
+                        id: MessageId([1; 16]),
+                        sender: MessageSender::Child,
+                        text: "Test message".to_string(),
+                        timestamp: UtcDateTime(1700000000000),
+                        delivery_status: DeliveryStatus::Failed {
+                            reason: "Network down".to_string(),
+                        },
+                    },
+                },
+                attempt_count: 1,
+                last_error: Some("Network down".to_string()),
+            }],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        match err {
+            PersistenceError::Validation(msg) => {
+                assert!(msg.contains("Invalid delivery_status"))
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_duplicate_timer_id_rejected() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Blocked,
+            active_actions: vec![
+                ScheduledAction {
+                    id: sample_timer_id(99),
+                    action_kind: ActionKind::BlockInternet,
+                    deadline: Deadline(UtcDateTime(1700000000000)),
+                    created_at: UtcDateTime(1699996400000),
+                    created_by: Initiator::ParentLocalPin,
+                    emitted_thresholds: HashSet::new(),
+                    execution_state: ActionExecutionState::Pending,
+                },
+                ScheduledAction {
+                    id: sample_timer_id(99),
+                    action_kind: ActionKind::ShutdownComputer,
+                    deadline: Deadline(UtcDateTime(1700000005000)),
+                    created_at: UtcDateTime(1699996400000),
+                    created_by: Initiator::ParentLocalPin,
+                    emitted_thresholds: HashSet::new(),
+                    execution_state: ActionExecutionState::Pending,
+                },
+            ],
+            internet_retry: None,
+            telegram_outbox: vec![],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        assert_eq!(err, PersistenceError::DuplicateTimerId(sample_timer_id(99)));
+    }
+
+    #[test]
+    fn encode_duplicate_outbox_entry_id_rejected() {
+        let state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: vec![],
+            internet_retry: None,
+            telegram_outbox: vec![
+                TelegramOutboxEntry {
+                    entry_id: sample_outbox_id(88),
+                    payload: TelegramPayload::ServiceNotification {
+                        text: "First".to_string(),
+                    },
+                    attempt_count: 0,
+                    last_error: None,
+                },
+                TelegramOutboxEntry {
+                    entry_id: sample_outbox_id(88),
+                    payload: TelegramPayload::ServiceNotification {
+                        text: "Second".to_string(),
+                    },
+                    attempt_count: 0,
+                    last_error: None,
+                },
+            ],
+        };
+
+        let err = encode_state_json(&state).unwrap_err();
+        assert_eq!(
+            err,
+            PersistenceError::DuplicateOutboxEntryId(sample_outbox_id(88))
+        );
+    }
+
+    #[test]
+    fn missing_root_internet_retry_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "telegram_outbox": []
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("missing field `internet_retry`"))
+            }
+            other => panic!("expected missing field internet_retry, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_internet_retry_last_error_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Blocked",
+            "active_actions": [],
+            "internet_retry": {
+                "attempt_count": 2
+            },
+            "telegram_outbox": []
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("missing field `last_error`"))
+            }
+            other => panic!("expected missing field last_error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_telegram_outbox_entry_last_error_rejected() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "ServiceNotification",
+                        "text": "Hello"
+                    },
+                    "attempt_count": 0
+                }
+            ]
+        }"#;
+
+        let err = decode_state_json(json).unwrap_err();
+        match err {
+            PersistenceError::Json(msg) => {
+                assert!(msg.contains("missing field `last_error`"))
+            }
+            other => panic!("expected missing field last_error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_null_internet_retry_remains_valid() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Unrestricted",
+            "active_actions": [],
+            "internet_retry": null,
+            "telegram_outbox": []
+        }"#;
+
+        let decoded = decode_state_json(json).expect("null internet_retry must be valid");
+        assert_eq!(decoded.internet_retry, None);
+    }
+
+    #[test]
+    fn explicit_null_last_error_remains_valid() {
+        let json = r#"{
+            "schema_version": 1,
+            "desired_internet_state": "Blocked",
+            "active_actions": [],
+            "internet_retry": {
+                "attempt_count": 3,
+                "last_error": null
+            },
+            "telegram_outbox": [
+                {
+                    "entry_id": "018f3a5b6c7d8e9f0a1b2c3d4e5f6081",
+                    "payload": {
+                        "kind": "ServiceNotification",
+                        "text": "Hello"
+                    },
+                    "attempt_count": 0,
+                    "last_error": null
+                }
+            ]
+        }"#;
+
+        let decoded = decode_state_json(json).expect("null last_error must be valid");
+        assert_eq!(
+            decoded.internet_retry,
+            Some(InternetRetry {
+                attempt_count: 3,
+                last_error: None
+            })
+        );
+        assert_eq!(decoded.telegram_outbox[0].last_error, None);
     }
 }
