@@ -13,7 +13,7 @@ Import-Module $govModule -Force
 
 $passCount = 0
 $failCount = 0
-$totalTests = 86
+$totalTests = 106
 $outputRoot = Join-Path $env:TEMP 'palka-selftest-runs-r3'
 if (Test-Path $outputRoot) { Remove-Item -Recurse -Force $outputRoot }
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
@@ -3013,6 +3013,1250 @@ try {
     }
 } catch {
     Report-Fail 'T86' 'CLI execution-envelope contract' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+
+# ----------------------------------------------------
+# T87 — Valid EVIDENCE_BUNDLE_V1 read-only operation completes and emits artifact.zip (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't87'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $artPath = $res.artifact_path
+    $artSha = $res.artifact_sha256
+    $exists = ($null -ne $artPath -and (Test-Path -LiteralPath $artPath -PathType Leaf))
+    $isZipName = ($null -ne $artPath -and $artPath.EndsWith('artifact.zip'))
+    $validSha = ($null -ne $artSha -and $artSha -match '^[0-9a-f]{64}$')
+
+    if ($res.result -eq 'COMPLETED' -and $res.mutation_state -eq 'NONE' -and $exists -and $isZipName -and $validSha) {
+        Report-Pass 'T87' 'Valid EVIDENCE_BUNDLE_V1 read-only operation completes and emits artifact.zip'
+    } else {
+        Report-Fail 'T87' 'Valid EVIDENCE_BUNDLE_V1 read-only operation completes and emits artifact.zip' "res=$($res.result), mut=$($res.mutation_state), exists=$exists, isZipName=$isZipName, validSha=$validSha"
+    }
+} catch {
+    Report-Fail 'T87' 'Valid EVIDENCE_BUNDLE_V1 read-only operation completes and emits artifact.zip' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T88 — Legacy PHASE_2A_RUN_DIRECTORY_V0 plus bootstrap_zip_v1 and case variants are rejected before native execution (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't88'
+    $variants = @('PHASE_2A_RUN_DIRECTORY_V0', 'phase_2a_run_directory_v0', 'bootstrap_zip_v1', 'evidence_bundle_v1', 'Evidence_Bundle_V1')
+    $allPassed = $true
+    $failReasons = @()
+
+    foreach ($var in $variants) {
+        $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{ 'artifact_profile' = $var }
+        $sha = Get-TestManifestSha256 $m.ManifestPath
+        $nativeCount = 0
+        $hook = { param($cmd, $ph, $p) $script:nativeCount++ }
+        $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru -TestPostStartHook $hook
+        if ($res.result -ne 'STOPPED' -or $res.mutation_state -ne 'NOT_APPLIED' -or $res.reason -notmatch 'artifact_profile' -or $nativeCount -ne 0) {
+            $allPassed = $false
+            $failReasons += "variant '$var': res=$($res.result), reason=$($res.reason), count=$nativeCount"
+        }
+        if (Test-Path $m.ManifestPath) { Remove-Item -Force $m.ManifestPath }
+    }
+
+    if ($allPassed) {
+        Report-Pass 'T88' 'Legacy PHASE_2A_RUN_DIRECTORY_V0 plus bootstrap_zip_v1 and case variants are rejected before native execution'
+    } else {
+        Report-Fail 'T88' 'Legacy PHASE_2A_RUN_DIRECTORY_V0 plus bootstrap_zip_v1 and case variants are rejected before native execution' ($failReasons -join '; ')
+    }
+} catch {
+    Report-Fail 'T88' 'Legacy PHASE_2A_RUN_DIRECTORY_V0 plus bootstrap_zip_v1 and case variants are rejected before native execution' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+}
+
+# ----------------------------------------------------
+# T89 — Successful canonical ZIP contains required root files, evidence/** and patches/changes.patch and no nested artifact.zip (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't89'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    $entryNames = @($zip.Entries | ForEach-Object { $_.FullName })
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $hasManifest = ($entryNames -contains 'manifest.json')
+    $hasSummary = ($entryNames -contains 'summary.json')
+    $hasCommands = ($entryNames -contains 'commands.jsonl')
+    $hasChecksums = ($entryNames -contains 'checksums.sha256')
+    $hasPatch = ($entryNames -contains 'patches/changes.patch')
+    $hasEvidence = (@($entryNames | Where-Object { $_ -like 'evidence/*' }).Count -gt 0)
+    $noNestedZip = (-not ($entryNames -contains 'artifact.zip'))
+
+    if ($hasManifest -and $hasSummary -and $hasCommands -and $hasChecksums -and $hasPatch -and $hasEvidence -and $noNestedZip) {
+        Report-Pass 'T89' 'Successful canonical ZIP contains required root files, evidence/** and patches/changes.patch and no nested artifact.zip'
+    } else {
+        Report-Fail 'T89' 'Successful canonical ZIP contains required root files, evidence/** and patches/changes.patch and no nested artifact.zip' "manifest=$hasManifest, summary=$hasSummary, commands=$hasCommands, checksums=$hasChecksums, patch=$hasPatch, evidence=$hasEvidence, noNested=$noNestedZip"
+    }
+} catch {
+    Report-Fail 'T89' 'Successful canonical ZIP contains required root files, evidence/** and patches/changes.patch and no nested artifact.zip' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T90 — checksums.sha256 covers every regular bundle content file except itself exactly once (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't90'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    $allEntries = @($zip.Entries | ForEach-Object { $_.FullName })
+
+    $cEntry = $zip.GetEntry('checksums.sha256')
+    $csStream = $cEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $csStream.CopyTo($ms)
+    $csText = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    $csStream.Dispose()
+    $ms.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $csLines = $csText.TrimEnd("`n").Split("`n")
+    $csPaths = @($csLines | ForEach-Object { ($_ -split '  ')[1] })
+
+    $expectedNonChecksum = @($allEntries | Where-Object { $_ -ne 'checksums.sha256' })
+    $uniqueCsPaths = [System.Collections.Generic.HashSet[string]]::new([string[]]$csPaths, [System.StringComparer]::Ordinal)
+
+    $countsMatch = ($csPaths.Length -eq $uniqueCsPaths.Count -and $csPaths.Length -eq $expectedNonChecksum.Length)
+    $noSelfInCs = (-not ($csPaths -contains 'checksums.sha256'))
+    $noZipInCs = (-not ($csPaths -contains 'artifact.zip'))
+
+    if ($countsMatch -and $noSelfInCs -and $noZipInCs) {
+        Report-Pass 'T90' 'checksums.sha256 covers every regular bundle content file except itself exactly once'
+    } else {
+        Report-Fail 'T90' 'checksums.sha256 covers every regular bundle content file except itself exactly once' "countsMatch=$countsMatch, noSelf=$noSelfInCs, noZip=$noZipInCs"
+    }
+} catch {
+    Report-Fail 'T90' 'checksums.sha256 covers every regular bundle content file except itself exactly once' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T91 — checksums.sha256 is lowercase, exactly two spaces, LF-only, final LF, ordinal path sorted (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't91'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    $cEntry = $zip.GetEntry('checksums.sha256')
+    $csStream = $cEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $csStream.CopyTo($ms)
+    $csBytes = $ms.ToArray()
+    $csStream.Dispose()
+    $ms.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $noCr = (-not ($csBytes -contains [byte]13)) # No CR
+    $hasFinalLf = ($csBytes.Length -gt 0 -and $csBytes[$csBytes.Length - 1] -eq [byte]10)
+    $csText = [System.Text.Encoding]::UTF8.GetString($csBytes)
+    $lines = $csText.TrimEnd("`n").Split("`n")
+
+    $allLinesValid = $true
+    $paths = @()
+    foreach ($line in $lines) {
+        if ($line -notmatch '^[0-9a-f]{64}  [^\s].*$') {
+            $allLinesValid = $false
+            break
+        }
+        $paths += ($line -split '  ')[1]
+    }
+
+    $isSorted = $true
+    for ($i = 0; $i -lt $paths.Length - 1; $i++) {
+        if ([System.StringComparer]::Ordinal.Compare($paths[$i], $paths[$i + 1]) -ge 0) {
+            $isSorted = $false
+            break
+        }
+    }
+
+    if ($noCr -and $hasFinalLf -and $allLinesValid -and $isSorted) {
+        Report-Pass 'T91' 'checksums.sha256 is lowercase, exactly two spaces, LF-only, final LF, ordinal path sorted'
+    } else {
+        Report-Fail 'T91' 'checksums.sha256 is lowercase, exactly two spaces, LF-only, final LF, ordinal path sorted' "noCr=$noCr, finalLf=$hasFinalLf, validLines=$allLinesValid, sorted=$isSorted"
+    }
+} catch {
+    Report-Fail 'T91' 'checksums.sha256 is lowercase, exactly two spaces, LF-only, final LF, ordinal path sorted' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T92 — At least one legitimate zero-byte stdout/stderr evidence file has the correct SHA-256 of empty bytes in checksums.sha256 (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't92'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    $csPath = Join-Path $res.run_directory 'checksums.sha256'
+    $csLines = [System.IO.File]::ReadAllLines($csPath)
+    $hasEmptyEvidenceHash = $false
+
+    foreach ($l in $csLines) {
+        if ($l.StartsWith($emptyHash) -and ($l.Contains('evidence/') -or $l.EndsWith('patches/changes.patch'))) {
+            $hasEmptyEvidenceHash = $true
+            break
+        }
+    }
+
+    if ($hasEmptyEvidenceHash) {
+        Report-Pass 'T92' 'At least one legitimate zero-byte stdout/stderr evidence file has the correct SHA-256 of empty bytes in checksums.sha256'
+    } else {
+        Report-Fail 'T92' 'At least one legitimate zero-byte stdout/stderr evidence file has the correct SHA-256 of empty bytes in checksums.sha256' 'No zero-byte evidence entry found with empty hash'
+    }
+} catch {
+    Report-Fail 'T92' 'At least one legitimate zero-byte stdout/stderr evidence file has the correct SHA-256 of empty bytes in checksums.sha256' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T93 — ZIP manifest.json is byte-identical to authorized input and run-directory manifest.json (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't93'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $inputBytes = [System.IO.File]::ReadAllBytes($m.ManifestPath)
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $runManifestBytes = [System.IO.File]::ReadAllBytes((Join-Path $res.run_directory 'manifest.json'))
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    $mEntry = $zip.GetEntry('manifest.json')
+    $msStream = $mEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $msStream.CopyTo($ms)
+    $zipManifestBytes = $ms.ToArray()
+    $msStream.Dispose()
+    $ms.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $runMatch = [System.Linq.Enumerable]::SequenceEqual($inputBytes, $runManifestBytes)
+    $zipMatch = [System.Linq.Enumerable]::SequenceEqual($inputBytes, $zipManifestBytes)
+
+    if ($runMatch -and $zipMatch) {
+        Report-Pass 'T93' 'ZIP manifest.json is byte-identical to authorized input and run-directory manifest.json'
+    } else {
+        Report-Fail 'T93' 'ZIP manifest.json is byte-identical to authorized input and run-directory manifest.json' "runMatch=$runMatch, zipMatch=$zipMatch"
+    }
+} catch {
+    Report-Fail 'T93' 'ZIP manifest.json is byte-identical to authorized input and run-directory manifest.json' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T94 — ZIP summary.json and commands.jsonl identity, ordinal fields, mandatory evidence paths, and command_count type (DEC-003 Phase 2B R3)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't94'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+
+    # 1. Base test: byte identity of summary.json and commands.jsonl
+    $sEntry = $zip.GetEntry('summary.json')
+    $ss = $sEntry.Open()
+    $sms = [System.IO.MemoryStream]::new()
+    $ss.CopyTo($sms)
+    $zipSummaryBytes = $sms.ToArray()
+    $ss.Dispose()
+    $sms.Dispose()
+
+    $cEntry = $zip.GetEntry('commands.jsonl')
+    $cs = $cEntry.Open()
+    $cms = [System.IO.MemoryStream]::new()
+    $cs.CopyTo($cms)
+    $zipCommandsBytes = $cms.ToArray()
+    $cs.Dispose()
+    $cms.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $runSummaryBytes = [System.IO.File]::ReadAllBytes((Join-Path $res.run_directory 'summary.json'))
+    $runCommandsBytes = [System.IO.File]::ReadAllBytes((Join-Path $res.run_directory 'commands.jsonl'))
+
+    $baseSumMatch = ([System.Convert]::ToBase64String($zipSummaryBytes) -eq [System.Convert]::ToBase64String($runSummaryBytes))
+    $baseCmdMatch = ([System.Convert]::ToBase64String($zipCommandsBytes) -eq [System.Convert]::ToBase64String($runCommandsBytes))
+
+    # Subcase A: Change summary.operation_id case only -> Verifier MUST reject (Ordinal identity)
+    $tamperedZipA = Join-Path $outputRoot 'tampered-t94-subA.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipA, $true)
+    $zStreamA = [System.IO.File]::Open($tamperedZipA, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zipA = [System.IO.Compression.ZipArchive]::new($zStreamA, [System.IO.Compression.ZipArchiveMode]::Update)
+    $sumObjA = [System.Text.Encoding]::UTF8.GetString($zipSummaryBytes) | ConvertFrom-Json
+    $sumObjA.operation_id = $sumObjA.operation_id.ToLowerInvariant()
+    $newSumBytesA = [System.Text.UTF8Encoding]::new($false).GetBytes(($sumObjA | ConvertTo-Json -Depth 5))
+    $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+    $newSumHashA = (($shaAlgo.ComputeHash($newSumBytesA) | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    # Rebuild checksums
+    $cEntryA = $zipA.GetEntry('checksums.sha256')
+    $csStreamA = $cEntryA.Open()
+    $msA = [System.IO.MemoryStream]::new()
+    $csStreamA.CopyTo($msA)
+    $oldCsTextA = [System.Text.Encoding]::UTF8.GetString($msA.ToArray())
+    $csStreamA.Dispose()
+    $msA.Dispose()
+
+    $csLinesA = [System.Collections.Generic.List[string]]::new()
+    foreach ($l in $oldCsTextA.TrimEnd("`n").Split("`n")) {
+        if ($l.EndsWith('summary.json')) {
+            $csLinesA.Add("$newSumHashA  summary.json")
+        } elseif ($l.Length -gt 0) {
+            $csLinesA.Add($l)
+        }
+    }
+    $newCsBytesA = [System.Text.UTF8Encoding]::new($false).GetBytes(($csLinesA -join "`n") + "`n")
+
+    $zipA.GetEntry('summary.json').Delete()
+    $newSumEntryA = $zipA.CreateEntry('summary.json')
+    $nsA = $newSumEntryA.Open()
+    $nsA.Write($newSumBytesA, 0, $newSumBytesA.Length)
+    $nsA.Dispose()
+
+    $cEntryA.Delete()
+    $newCsEntryA = $zipA.CreateEntry('checksums.sha256')
+    $ncsA = $newCsEntryA.Open()
+    $ncsA.Write($newCsBytesA, 0, $newCsBytesA.Length)
+    $ncsA.Dispose()
+
+    $zipA.Dispose()
+    $zStreamA.Dispose()
+
+    $subARejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipA | Out-Null
+    } catch {
+        $subARejected = ($_.Exception.Message -match 'Ordinal mismatch|does not match manifest')
+    }
+
+    # Subcase B: In one commands.jsonl record set stdout_path=null, stderr_path=null -> Verifier MUST reject
+    $tamperedZipB = Join-Path $outputRoot 'tampered-t94-subB.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipB, $true)
+    $zStreamB = [System.IO.File]::Open($tamperedZipB, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zipB = [System.IO.Compression.ZipArchive]::new($zStreamB, [System.IO.Compression.ZipArchiveMode]::Update)
+    $cmdLinesB = ([System.Text.Encoding]::UTF8.GetString($zipCommandsBytes)).TrimEnd("`n").Split("`n")
+    $firstCmdObjB = $cmdLinesB[0] | ConvertFrom-Json
+    $firstCmdObjB.stdout_path = $null
+    $firstCmdObjB.stderr_path = $null
+    $cmdLinesB[0] = ($firstCmdObjB | ConvertTo-Json -Compress)
+    $newCmdBytesB = [System.Text.UTF8Encoding]::new($false).GetBytes(($cmdLinesB -join "`n") + "`n")
+    $newCmdHashB = (($shaAlgo.ComputeHash($newCmdBytesB) | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    $zipB.GetEntry('commands.jsonl').Delete()
+    $newCmdEntryB = $zipB.CreateEntry('commands.jsonl')
+    $ncmdB = $newCmdEntryB.Open()
+    $ncmdB.Write($newCmdBytesB, 0, $newCmdBytesB.Length)
+    $ncmdB.Dispose()
+
+    # Rebuild checksums
+    $cEntryB = $zipB.GetEntry('checksums.sha256')
+    $csStreamB = $cEntryB.Open()
+    $msB = [System.IO.MemoryStream]::new()
+    $csStreamB.CopyTo($msB)
+    $oldCsTextB = [System.Text.Encoding]::UTF8.GetString($msB.ToArray())
+    $csStreamB.Dispose()
+    $msB.Dispose()
+
+    $csLinesB = [System.Collections.Generic.List[string]]::new()
+    foreach ($l in $oldCsTextB.TrimEnd("`n").Split("`n")) {
+        if ($l.EndsWith('commands.jsonl')) {
+            $csLinesB.Add("$newCmdHashB  commands.jsonl")
+        } elseif ($l.Length -gt 0) {
+            $csLinesB.Add($l)
+        }
+    }
+    $newCsBytesB = [System.Text.UTF8Encoding]::new($false).GetBytes(($csLinesB -join "`n") + "`n")
+
+    $cEntryB.Delete()
+    $newCsEntryB = $zipB.CreateEntry('checksums.sha256')
+    $ncsB = $newCsEntryB.Open()
+    $ncsB.Write($newCsBytesB, 0, $newCsBytesB.Length)
+    $ncsB.Dispose()
+
+    $zipB.Dispose()
+    $zStreamB.Dispose()
+
+    $subBRejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipB | Out-Null
+    } catch {
+        $subBRejected = ($_.Exception.Message -match 'missing|invalid|empty stdout_path|VERIFIER_FAILURE')
+    }
+
+    # Subcase C: summary.command_count changed from integer to JSON string -> Verifier MUST reject
+    $tamperedZipC = Join-Path $outputRoot 'tampered-t94-subC.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipC, $true)
+    $zStreamC = [System.IO.File]::Open($tamperedZipC, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zipC = [System.IO.Compression.ZipArchive]::new($zStreamC, [System.IO.Compression.ZipArchiveMode]::Update)
+    $sumTextC = [System.Text.Encoding]::UTF8.GetString($zipSummaryBytes)
+    # Replace integer command_count with string "N"
+    $sumTextCModified = $sumTextC -replace '"command_count":\s*(\d+)', '"command_count": "$1"'
+    $newSumBytesC = [System.Text.UTF8Encoding]::new($false).GetBytes($sumTextCModified)
+    $newSumHashC = (($shaAlgo.ComputeHash($newSumBytesC) | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    $zipC.GetEntry('summary.json').Delete()
+    $newSumEntryC = $zipC.CreateEntry('summary.json')
+    $nsC = $newSumEntryC.Open()
+    $nsC.Write($newSumBytesC, 0, $newSumBytesC.Length)
+    $nsC.Dispose()
+
+    # Rebuild checksums
+    $cEntryC = $zipC.GetEntry('checksums.sha256')
+    $csStreamC = $cEntryC.Open()
+    $msC = [System.IO.MemoryStream]::new()
+    $csStreamC.CopyTo($msC)
+    $oldCsTextC = [System.Text.Encoding]::UTF8.GetString($msC.ToArray())
+    $csStreamC.Dispose()
+    $msC.Dispose()
+
+    $csLinesC = [System.Collections.Generic.List[string]]::new()
+    foreach ($l in $oldCsTextC.TrimEnd("`n").Split("`n")) {
+        if ($l.EndsWith('summary.json')) {
+            $csLinesC.Add("$newSumHashC  summary.json")
+        } elseif ($l.Length -gt 0) {
+            $csLinesC.Add($l)
+        }
+    }
+    $newCsBytesC = [System.Text.UTF8Encoding]::new($false).GetBytes(($csLinesC -join "`n") + "`n")
+
+    $cEntryC.Delete()
+    $newCsEntryC = $zipC.CreateEntry('checksums.sha256')
+    $ncsC = $newCsEntryC.Open()
+    $ncsC.Write($newCsBytesC, 0, $newCsBytesC.Length)
+    $ncsC.Dispose()
+
+    $zipC.Dispose()
+    $zStreamC.Dispose()
+
+    $subCRejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipC | Out-Null
+    } catch {
+        $subCRejected = ($_.Exception.Message -match 'integer|VERIFIER_FAILURE')
+    }
+
+    if ($baseSumMatch -and $baseCmdMatch -and $subARejected -and $subBRejected -and $subCRejected) {
+        Report-Pass 'T94' 'ZIP summary.json and commands.jsonl are byte-identical to run-directory copies'
+    } else {
+        Report-Fail 'T94' 'ZIP summary.json and commands.jsonl are byte-identical to run-directory copies' "sumMatch=$baseSumMatch, cmdMatch=$baseCmdMatch, subA=$subARejected, subB=$subBRejected, subC=$subCRejected"
+    }
+} catch {
+    Report-Fail 'T94' 'ZIP summary.json and commands.jsonl are byte-identical to run-directory copies' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T95 — Returned ARTIFACT_SHA256 equals independent SHA-256 of final artifact.zip and the hash string is not present anywhere inside ZIP content (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't95'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $zipBytes = [System.IO.File]::ReadAllBytes($res.artifact_path)
+    $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+    $calcZipHash = (($shaAlgo.ComputeHash($zipBytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    $hashesMatch = [string]::Equals($calcZipHash, $res.artifact_sha256, [System.StringComparison]::Ordinal)
+
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    $foundHashInContent = $false
+    foreach ($entry in $zip.Entries) {
+        $es = $entry.Open()
+        $ms = [System.IO.MemoryStream]::new()
+        $es.CopyTo($ms)
+        $content = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+        $es.Dispose()
+        $ms.Dispose()
+        if ($content.Contains($calcZipHash)) {
+            $foundHashInContent = $true
+            break
+        }
+    }
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    if ($hashesMatch -and (-not $foundHashInContent)) {
+        Report-Pass 'T95' 'Returned ARTIFACT_SHA256 equals independent SHA-256 of final artifact.zip and hash is not inside ZIP'
+    } else {
+        Report-Fail 'T95' 'Returned ARTIFACT_SHA256 equals independent SHA-256 of final artifact.zip and hash is not inside ZIP' "hashesMatch=$hashesMatch, foundInContent=$foundHashInContent"
+    }
+} catch {
+    Report-Fail 'T95' 'Returned ARTIFACT_SHA256 equals independent SHA-256 of final artifact.zip and hash is not inside ZIP' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T96 — Clean operation has zero-byte patches/changes.patch and it is correctly covered by checksums.sha256 (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't96'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $patchBytes = [System.IO.File]::ReadAllBytes((Join-Path $res.run_directory 'patches/changes.patch'))
+    $isZeroByte = ($patchBytes.Length -eq 0)
+
+    $emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    $expectedLine = "$emptyHash  patches/changes.patch"
+    $csLines = [System.IO.File]::ReadAllLines((Join-Path $res.run_directory 'checksums.sha256'))
+    $hasCorrectCsLine = ($csLines -contains $expectedLine)
+
+    if ($isZeroByte -and $hasCorrectCsLine) {
+        Report-Pass 'T96' 'Clean operation has zero-byte patches/changes.patch and it is correctly covered by checksums.sha256'
+    } else {
+        Report-Fail 'T96' 'Clean operation has zero-byte patches/changes.patch and it is correctly covered by checksums.sha256' "isZeroByte=$isZeroByte, hasCsLine=$hasCorrectCsLine"
+    }
+} catch {
+    Report-Fail 'T96' 'Clean operation has zero-byte patches/changes.patch and it is correctly covered by checksums.sha256' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T97 — Authorized dirty-working-tree test operation produces non-empty patches/changes.patch byte-identical to builtin-bundle-patch stdout evidence (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't97'
+    # Create dirty working tree file authorized by authorized_paths = **
+    [System.IO.File]::AppendAllText((Join-Path $repo.RepoDir 'README.md'), "Dirty line`n")
+
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $patchPath = Join-Path $res.run_directory 'patches/changes.patch'
+    $patchBytes = [System.IO.File]::ReadAllBytes($patchPath)
+    $isNonEmpty = ($patchBytes.Length -gt 0)
+
+    # Locate builtin-bundle-patch evidence stdout
+    $allEvidence = @(Get-ChildItem -LiteralPath (Join-Path $res.run_directory 'evidence') -Filter '*-builtin-bundle-patch-stdout.txt')
+    $hasEvidence = ($allEvidence.Count -eq 1)
+    $stdoutBytes = if ($hasEvidence) { [System.IO.File]::ReadAllBytes($allEvidence[0].FullName) } else { @() }
+    $isIdentical = ($hasEvidence -and [System.Linq.Enumerable]::SequenceEqual([byte[]]$patchBytes, [byte[]]$stdoutBytes))
+
+    if ($res.result -eq 'COMPLETED' -and $isNonEmpty -and $hasEvidence -and $isIdentical) {
+        Report-Pass 'T97' 'Authorized dirty-working-tree test operation produces non-empty patches/changes.patch byte-identical to stdout evidence'
+    } else {
+        Report-Fail 'T97' 'Authorized dirty-working-tree test operation produces non-empty patches/changes.patch byte-identical to stdout evidence' "res=$($res.result), nonEmpty=$isNonEmpty, hasEv=$hasEvidence, identical=$isIdentical"
+    }
+} catch {
+    Report-Fail 'T97' 'Authorized dirty-working-tree test operation produces non-empty patches/changes.patch byte-identical to stdout evidence' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T98 — Test-PalkaEvidenceBundle accepts an untouched genuine bundle and engine self-verification is proven (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't98'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $verifyResult = Test-PalkaEvidenceBundle -ArtifactPath $res.artifact_path
+
+    # Assert production engine self-verification call and order directly from module source
+    $psm1Content = [System.IO.File]::ReadAllText((Join-Path (Split-Path -Parent $scriptDir) 'PalkaGovernance.psm1'))
+    $hasSelfVerify = ($psm1Content -match 'Test-PalkaEvidenceBundle\s+-ArtifactPath\s+\$finalArtifactPath')
+    $idxMove = $psm1Content.IndexOf('[System.IO.File]::Move($tempZipPath, $finalArtifactPath)')
+    $idxVerify = $psm1Content.IndexOf('Test-PalkaEvidenceBundle -ArtifactPath $finalArtifactPath')
+    $idxAssign = $psm1Content.IndexOf('$artifactPath = $finalArtifactPath')
+    $correctOrder = ($idxMove -ge 0 -and $idxVerify -gt $idxMove -and $idxAssign -gt $idxVerify)
+
+    if ($verifyResult -eq $true -and $hasSelfVerify -and $correctOrder) {
+        Report-Pass 'T98' 'Test-PalkaEvidenceBundle accepts an untouched genuine bundle'
+    } else {
+        Report-Fail 'T98' 'Test-PalkaEvidenceBundle accepts an untouched genuine bundle' "got: $verifyResult, hasSelfVerify=$hasSelfVerify, correctOrder=$correctOrder"
+    }
+} catch {
+    Report-Fail 'T98' 'Test-PalkaEvidenceBundle accepts an untouched genuine bundle' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T99 — Tamper one archived content byte without updating checksums: verifier rejects (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't99'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    # Create tampered copy of zip
+    $tamperedZipPath = Join-Path $outputRoot 'tampered-t99.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath, $true)
+
+    # Modify manifest.json inside tampered zip
+    $zipStream = [System.IO.File]::Open($tamperedZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Update)
+    $oldBytes = & {
+        $e = $zip.GetEntry('manifest.json')
+        $s = $e.Open()
+        $mem = [System.IO.MemoryStream]::new()
+        $s.CopyTo($mem)
+        $s.Dispose()
+        $mem.ToArray()
+    }
+    $oldBytes[0] = if ($oldBytes[0] -eq [byte]65) { [byte]66 } else { [byte]65 }
+    $zip.GetEntry('manifest.json').Delete()
+    $newEntry = $zip.CreateEntry('manifest.json')
+    $ns = $newEntry.Open()
+    $ns.Write($oldBytes, 0, $oldBytes.Length)
+    $ns.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath | Out-Null
+    } catch {
+        $rejected = ($_.Exception.Message -match 'Checksum mismatch')
+    }
+
+    if ($rejected) {
+        Report-Pass 'T99' 'Tamper one archived content byte without updating checksums: verifier rejects'
+    } else {
+        Report-Fail 'T99' 'Tamper one archived content byte without updating checksums: verifier rejects' 'Verifier did not reject tampered bundle'
+    }
+} catch {
+    Report-Fail 'T99' 'Tamper one archived content byte without updating checksums: verifier rejects' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T100 — Remove one required checksum line: verifier rejects (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't100'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $tamperedZipPath = Join-Path $outputRoot 'tampered-t100.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath, $true)
+
+    # Read checksums, remove one line, rewrite entry
+    $zipStream = [System.IO.File]::Open($tamperedZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Update)
+    $cEntry = $zip.GetEntry('checksums.sha256')
+    $cs = $cEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $cs.CopyTo($ms)
+    $csText = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    $cs.Dispose()
+    $ms.Dispose()
+
+    $lines = [System.Collections.Generic.List[string]]::new([string[]]($csText.TrimEnd("`n").Split("`n")))
+    $lines.RemoveAt(0) # remove first line
+    $newCsBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($lines -join "`n") + "`n")
+
+    $cEntry.Delete()
+    $newEntry = $zip.CreateEntry('checksums.sha256')
+    $newEntryStream = $newEntry.Open()
+    $newEntryStream.Write($newCsBytes, 0, $newCsBytes.Length)
+    $newEntryStream.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath | Out-Null
+    } catch {
+        $rejected = ($_.Exception.Message -match 'no corresponding entry in checksums|does not exist in archive|Checksum')
+    }
+
+    if ($rejected) {
+        Report-Pass 'T100' 'Remove one required checksum line: verifier rejects'
+    } else {
+        Report-Fail 'T100' 'Remove one required checksum line: verifier rejects' 'Verifier did not reject missing checksum line'
+    }
+} catch {
+    Report-Fail 'T100' 'Remove one required checksum line: verifier rejects' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T101 — Duplicate one checksum path: verifier rejects (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't101'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $tamperedZipPath = Join-Path $outputRoot 'tampered-t101.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath, $true)
+
+    $zipStream = [System.IO.File]::Open($tamperedZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Update)
+    $cEntry = $zip.GetEntry('checksums.sha256')
+    $cs = $cEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $cs.CopyTo($ms)
+    $csText = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    $cs.Dispose()
+    $ms.Dispose()
+
+    $lines = $csText.TrimEnd("`n").Split("`n")
+    $dupText = $csText + $lines[0] + "`n" # duplicate first line at end
+    $newCsBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($dupText)
+
+    $cEntry.Delete()
+    $newEntry = $zip.CreateEntry('checksums.sha256')
+    $newEntryStream = $newEntry.Open()
+    $newEntryStream.Write($newCsBytes, 0, $newCsBytes.Length)
+    $newEntryStream.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath | Out-Null
+    } catch {
+        $rejected = ($_.Exception.Message -match 'Duplicate path|not sorted')
+    }
+
+    if ($rejected) {
+        Report-Pass 'T101' 'Duplicate one checksum path: verifier rejects'
+    } else {
+        Report-Fail 'T101' 'Duplicate one checksum path: verifier rejects' 'Verifier did not reject duplicate checksum path'
+    }
+} catch {
+    Report-Fail 'T101' 'Duplicate one checksum path: verifier rejects' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T102 — Uppercase one checksum digest: verifier rejects (DEC-003 Phase 2B R3)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't102'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $tamperedZipPath = Join-Path $outputRoot 'tampered-t102.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath, $true)
+
+    $zipStream = [System.IO.File]::Open($tamperedZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Update)
+    $cEntry = $zip.GetEntry('checksums.sha256')
+    $cs = $cEntry.Open()
+    $ms = [System.IO.MemoryStream]::new()
+    $cs.CopyTo($ms)
+    $csText = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    $cs.Dispose()
+    $ms.Dispose()
+
+    # Uppercase hash on first line
+    $lines = $csText.TrimEnd("`n").Split("`n")
+    $firstParts = $lines[0] -split '  '
+    $lines[0] = "$($firstParts[0].ToUpper())  $($firstParts[1])"
+    $newCsBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($lines -join "`n") + "`n")
+
+    $cEntry.Delete()
+    $newEntry = $zip.CreateEntry('checksums.sha256')
+    $newEntryStream = $newEntry.Open()
+    $newEntryStream.Write($newCsBytes, 0, $newCsBytes.Length)
+    $newEntryStream.Dispose()
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $rejected = $false
+    $rejectedReason = ''
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath | Out-Null
+    } catch {
+        $rejectedReason = $_.Exception.Message
+        $rejected = ($_.Exception.Message -match 'Malformed checksum line')
+    }
+
+    if ($rejected) {
+        Report-Pass 'T102' 'Uppercase one checksum digest: verifier rejects'
+    } else {
+        Report-Fail 'T102' 'Uppercase one checksum digest: verifier rejects' "Verifier did not reject as Malformed checksum line (got: '$rejectedReason')"
+    }
+} catch {
+    Report-Fail 'T102' 'Uppercase one checksum digest: verifier rejects' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T103 — Canonical namespace allowlist enforcement and directory entry rejection (DEC-003 Phase 2B R3)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't103'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    # Subcase 1: Extra regular file WITHOUT checksum entry -> REJECT
+    $tamperedZip1 = Join-Path $outputRoot 'tampered-t103-sub1.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZip1, $true)
+
+    $zipStream1 = [System.IO.File]::Open($tamperedZip1, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip1 = [System.IO.Compression.ZipArchive]::new($zipStream1, [System.IO.Compression.ZipArchiveMode]::Update)
+    $extraEntry1 = $zip1.CreateEntry('extra_untracked.txt')
+    $es1 = $extraEntry1.Open()
+    $extraBytes1 = [System.Text.Encoding]::UTF8.GetBytes("extra file content")
+    $es1.Write($extraBytes1, 0, $extraBytes1.Length)
+    $es1.Dispose()
+    $zip1.Dispose()
+    $zipStream1.Dispose()
+
+    $sub1Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZip1 | Out-Null
+    } catch {
+        $sub1Rejected = ($_.Exception.Message -match 'Non-canonical ZIP entry|no corresponding entry in checksums|VERIFIER_FAILURE')
+    }
+
+    # Subcase 2: Extra regular file WITH VALID MATCHING CHECKSUM and updated checksums.sha256 -> MUST STILL REJECT (Non-canonical allowlist)
+    $tamperedZip2 = Join-Path $outputRoot 'tampered-t103-sub2.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZip2, $true)
+
+    $zipStream2 = [System.IO.File]::Open($tamperedZip2, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip2 = [System.IO.Compression.ZipArchive]::new($zipStream2, [System.IO.Compression.ZipArchiveMode]::Update)
+
+    # Read existing checksums
+    $cEntry2 = $zip2.GetEntry('checksums.sha256')
+    $csStream2 = $cEntry2.Open()
+    $ms2 = [System.IO.MemoryStream]::new()
+    $csStream2.CopyTo($ms2)
+    $oldCsText2 = [System.Text.Encoding]::UTF8.GetString($ms2.ToArray())
+    $csStream2.Dispose()
+    $ms2.Dispose()
+
+    # Add extra regular file
+    $extraEntry2 = $zip2.CreateEntry('extra_untracked.txt')
+    $es2 = $extraEntry2.Open()
+    $extraBytes2 = [System.Text.Encoding]::UTF8.GetBytes("extra file content")
+    $es2.Write($extraBytes2, 0, $extraBytes2.Length)
+    $es2.Dispose()
+
+    $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+    $extraHashBytes = $shaAlgo.ComputeHash($extraBytes2)
+    $extraHexHash = (($extraHashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    # Build updated checksums with exact hash and canonical order
+    $csLines2 = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $oldCsText2.TrimEnd("`n").Split("`n")) {
+        if ($line.Length -gt 0) { $csLines2.Add($line) }
+    }
+    $csLines2.Add("$extraHexHash  extra_untracked.txt")
+    $csLines2Array = $csLines2.ToArray()
+    [System.Array]::Sort($csLines2Array, [System.Collections.Generic.Comparer[string]]::Create({
+        param($a, $b)
+        $pa = ($a -split '  ')[1]
+        $pb = ($b -split '  ')[1]
+        [System.StringComparer]::Ordinal.Compare($pa, $pb)
+    }))
+
+    $newCsText2 = ($csLines2Array -join "`n") + "`n"
+    $newCsBytes2 = [System.Text.UTF8Encoding]::new($false).GetBytes($newCsText2)
+
+    $cEntry2.Delete()
+    $newEntry2 = $zip2.CreateEntry('checksums.sha256')
+    $ns2 = $newEntry2.Open()
+    $ns2.Write($newCsBytes2, 0, $newCsBytes2.Length)
+    $ns2.Dispose()
+
+    $zip2.Dispose()
+    $zipStream2.Dispose()
+
+    $sub2Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZip2 | Out-Null
+    } catch {
+        $sub2Rejected = ($_.Exception.Message -match 'Non-canonical|VERIFIER_FAILURE')
+    }
+
+    # Subcase 3: ZIP directory entry (e.g. extra_dir/) -> REJECT
+    $tamperedZip3 = Join-Path $outputRoot 'tampered-t103-sub3.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZip3, $true)
+
+    $zipStream3 = [System.IO.File]::Open($tamperedZip3, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip3 = [System.IO.Compression.ZipArchive]::new($zipStream3, [System.IO.Compression.ZipArchiveMode]::Update)
+    $dirEntry3 = $zip3.CreateEntry('extra_dir/')
+    $zip3.Dispose()
+    $zipStream3.Dispose()
+
+    $sub3Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZip3 | Out-Null
+    } catch {
+        $sub3Rejected = ($_.Exception.Message -match 'directory|VERIFIER_FAILURE')
+    }
+
+    # Subcase 4: Case-variant regular entry (MANIFEST.JSON) -> REJECT
+    $tamperedZip4 = Join-Path $outputRoot 'tampered-t103-sub4.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZip4, $true)
+
+    $zipStream4 = [System.IO.File]::Open($tamperedZip4, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip4 = [System.IO.Compression.ZipArchive]::new($zipStream4, [System.IO.Compression.ZipArchiveMode]::Update)
+    $manBytes4 = [System.Text.Encoding]::UTF8.GetBytes('{"case_variant":true}')
+    $manHash4 = (($shaAlgo.ComputeHash($manBytes4) | ForEach-Object { $_.ToString('x2') }) -join '')
+    $manEntry4 = $zip4.CreateEntry('MANIFEST.JSON')
+    $ms4 = $manEntry4.Open()
+    $ms4.Write($manBytes4, 0, $manBytes4.Length)
+    $ms4.Dispose()
+
+    # Rebuild checksums with MANIFEST.JSON
+    $cEntry4 = $zip4.GetEntry('checksums.sha256')
+    $csStream4 = $cEntry4.Open()
+    $msMem4 = [System.IO.MemoryStream]::new()
+    $csStream4.CopyTo($msMem4)
+    $oldCsText4 = [System.Text.Encoding]::UTF8.GetString($msMem4.ToArray())
+    $csStream4.Dispose()
+    $msMem4.Dispose()
+
+    $csLines4 = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $oldCsText4.TrimEnd("`n").Split("`n")) {
+        if ($line.Length -gt 0) { $csLines4.Add($line) }
+    }
+    $csLines4.Add("$manHash4  MANIFEST.JSON")
+    $csLines4Array = $csLines4.ToArray()
+    [System.Array]::Sort($csLines4Array, [System.Collections.Generic.Comparer[string]]::Create({
+        param($a, $b)
+        $pa = ($a -split '  ')[1]
+        $pb = ($b -split '  ')[1]
+        [System.StringComparer]::Ordinal.Compare($pa, $pb)
+    }))
+
+    $newCsText4 = ($csLines4Array -join "`n") + "`n"
+    $newCsBytes4 = [System.Text.UTF8Encoding]::new($false).GetBytes($newCsText4)
+
+    $cEntry4.Delete()
+    $newEntry4 = $zip4.CreateEntry('checksums.sha256')
+    $ns4 = $newEntry4.Open()
+    $ns4.Write($newCsBytes4, 0, $newCsBytes4.Length)
+    $ns4.Dispose()
+
+    $zip4.Dispose()
+    $zipStream4.Dispose()
+
+    $sub4Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZip4 | Out-Null
+    } catch {
+        $sub4Rejected = ($_.Exception.Message -match 'Non-canonical|VERIFIER_FAILURE')
+    }
+
+    if ($sub1Rejected -and $sub2Rejected -and $sub3Rejected -and $sub4Rejected) {
+        Report-Pass 'T103' 'Insert an extra regular ZIP file without checksum entry: verifier rejects'
+    } else {
+        Report-Fail 'T103' 'Insert an extra regular ZIP file without checksum entry: verifier rejects' "sub1=$sub1Rejected, sub2=$sub2Rejected, sub3=$sub3Rejected, sub4=$sub4Rejected"
+    }
+} catch {
+    Report-Fail 'T103' 'Insert an extra regular ZIP file without checksum entry: verifier rejects' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T104 — Unsafe archive/checksum path such as ../escape.txt and dot segment rejection (DEC-003 Phase 2B R3)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't104'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    # Subcase 1: ../escape.txt
+    $tamperedZipPath1 = Join-Path $outputRoot 'tampered-t104-sub1.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath1, $true)
+
+    $zipStream1 = [System.IO.File]::Open($tamperedZipPath1, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip1 = [System.IO.Compression.ZipArchive]::new($zipStream1, [System.IO.Compression.ZipArchiveMode]::Update)
+    $escapeEntry = $zip1.CreateEntry('../escape.txt')
+    $es = $escapeEntry.Open()
+    $esBytes = [System.Text.Encoding]::UTF8.GetBytes("escape")
+    $es.Write($esBytes, 0, $esBytes.Length)
+    $es.Dispose()
+    $zip1.Dispose()
+    $zipStream1.Dispose()
+
+    $sub1Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath1 | Out-Null
+    } catch {
+        $sub1Rejected = ($_.Exception.Message -match 'invalid path segment|directory traversal|VERIFIER_FAILURE')
+    }
+
+    # Subcase 2: evidence/./dot-segment.txt with valid checksum
+    $tamperedZipPath2 = Join-Path $outputRoot 'tampered-t104-sub2.zip'
+    [System.IO.File]::Copy($res.artifact_path, $tamperedZipPath2, $true)
+
+    $zipStream2 = [System.IO.File]::Open($tamperedZipPath2, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite)
+    $zip2 = [System.IO.Compression.ZipArchive]::new($zipStream2, [System.IO.Compression.ZipArchiveMode]::Update)
+    $dotBytes = [System.Text.Encoding]::UTF8.GetBytes("dot segment content")
+    $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+    $dotHash = (($shaAlgo.ComputeHash($dotBytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    $dotEntry = $zip2.CreateEntry('evidence/./dot-segment.txt')
+    $ds = $dotEntry.Open()
+    $ds.Write($dotBytes, 0, $dotBytes.Length)
+    $ds.Dispose()
+
+    # Rebuild checksums with evidence/./dot-segment.txt
+    $cEntry2 = $zip2.GetEntry('checksums.sha256')
+    $csStream2 = $cEntry2.Open()
+    $ms2 = [System.IO.MemoryStream]::new()
+    $csStream2.CopyTo($ms2)
+    $oldCsText2 = [System.Text.Encoding]::UTF8.GetString($ms2.ToArray())
+    $csStream2.Dispose()
+    $ms2.Dispose()
+
+    $csLines2 = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $oldCsText2.TrimEnd("`n").Split("`n")) {
+        if ($line.Length -gt 0) { $csLines2.Add($line) }
+    }
+    $csLines2.Add("$dotHash  evidence/./dot-segment.txt")
+    $csLines2Array = $csLines2.ToArray()
+    [System.Array]::Sort($csLines2Array, [System.Collections.Generic.Comparer[string]]::Create({
+        param($a, $b)
+        $pa = ($a -split '  ')[1]
+        $pb = ($b -split '  ')[1]
+        [System.StringComparer]::Ordinal.Compare($pa, $pb)
+    }))
+
+    $newCsText2 = ($csLines2Array -join "`n") + "`n"
+    $newCsBytes2 = [System.Text.UTF8Encoding]::new($false).GetBytes($newCsText2)
+
+    $cEntry2.Delete()
+    $newEntry2 = $zip2.CreateEntry('checksums.sha256')
+    $ns2 = $newEntry2.Open()
+    $ns2.Write($newCsBytes2, 0, $newCsBytes2.Length)
+    $ns2.Dispose()
+
+    $zip2.Dispose()
+    $zipStream2.Dispose()
+
+    $sub2Rejected = $false
+    try {
+        Test-PalkaEvidenceBundle -ArtifactPath $tamperedZipPath2 | Out-Null
+    } catch {
+        $sub2Rejected = ($_.Exception.Message -match 'invalid path segment|VERIFIER_FAILURE')
+    }
+
+    if ($sub1Rejected -and $sub2Rejected) {
+        Report-Pass 'T104' 'Unsafe archive/checksum path such as ../escape.txt: verifier rejects without writing outside controlled location'
+    } else {
+        Report-Fail 'T104' 'Unsafe archive/checksum path such as ../escape.txt: verifier rejects without writing outside controlled location' "sub1=$sub1Rejected, sub2=$sub2Rejected"
+    }
+} catch {
+    Report-Fail 'T104' 'Unsafe archive/checksum path such as ../escape.txt: verifier rejects without writing outside controlled location' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T105 — A digest-valid operation that STOPs at a read-only precondition after run-directory creation still produces a valid canonical bundle whose summary says STOPPED / NOT_APPLIED and whose journal contains only actually started commands (DEC-003 Phase 2B R3)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't105'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha -CustomProperties @{
+        'authorized_commands' = @(
+            [ordered]@{
+                'id' = 'mutating-action'
+                'executable' = 'git'
+                'arguments' = @('branch', 'new-branch-t105')
+                'cwd' = $repo.RepoDir
+                'mutating' = $true
+                'expect' = [ordered]@{ 'exit_code' = 0 }
+            }
+        )
+        'required_preconditions' = @(
+            [ordered]@{
+                'id' = 'failing-precondition'
+                'executable' = 'git'
+                'arguments' = @('rev-parse', 'nonexistent-ref-xyz')
+                'cwd' = $repo.RepoDir
+                'mutating' = $false
+                'expect' = [ordered]@{ 'exit_code' = 0 }
+            }
+        )
+    }
+    $sha = Get-TestManifestSha256 $m.ManifestPath
+    $res = Invoke-PalkaEngine -ManifestPath $m.ManifestPath -OutputRoot $outputRoot -AuthorizedManifestSha256 $sha -PassThru
+
+    $stoppedProperly = ($res.result -eq 'STOPPED' -and $res.mutation_state -eq 'NOT_APPLIED')
+    $artExists = ($null -ne $res.artifact_path -and (Test-Path -LiteralPath $res.artifact_path))
+    $bundleValid = if ($artExists) { Test-PalkaEvidenceBundle -ArtifactPath $res.artifact_path } else { $false }
+
+    # Check summary and commands inside zip
+    $zipStream = [System.IO.File]::OpenRead($res.artifact_path)
+    $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+
+    $sEntry = $zip.GetEntry('summary.json')
+    $ss = $sEntry.Open()
+    $sms = [System.IO.MemoryStream]::new()
+    $ss.CopyTo($sms)
+    $zipSumText = [System.Text.Encoding]::UTF8.GetString($sms.ToArray())
+    $ss.Dispose()
+    $sms.Dispose()
+
+    $cEntry = $zip.GetEntry('commands.jsonl')
+    $cs = $cEntry.Open()
+    $cms = [System.IO.MemoryStream]::new()
+    $cs.CopyTo($cms)
+    $zipCmdText = [System.Text.Encoding]::UTF8.GetString($cms.ToArray())
+    $cs.Dispose()
+    $cms.Dispose()
+
+    $zipSumObj = $zipSumText | ConvertFrom-Json
+    $sumMatches = ($zipSumObj.result -eq 'STOPPED' -and $zipSumObj.mutation_state -eq 'NOT_APPLIED')
+
+    # Inspect commands.jsonl records: exactly 4 started commands
+    $cmdLines = @($zipCmdText.Trim().Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
+    $cmdObjs = @($cmdLines | ForEach-Object { $_ | ConvertFrom-Json })
+    $cmdIds = @($cmdObjs | ForEach-Object { $_.command_id })
+
+    $expectedCmdIds = @(
+        'builtin-preflight-toplevel',
+        'builtin-preflight-branch',
+        'builtin-preflight-head',
+        'failing-precondition'
+    )
+
+    $countMatch = ($cmdObjs.Count -eq 4)
+    $idsMatch = ($cmdIds.Count -eq 4 -and
+                 $cmdIds[0] -eq 'builtin-preflight-toplevel' -and
+                 $cmdIds[1] -eq 'builtin-preflight-branch' -and
+                 $cmdIds[2] -eq 'builtin-preflight-head' -and
+                 $cmdIds[3] -eq 'failing-precondition')
+    $noMutatingAction = (-not ($cmdIds -contains 'mutating-action'))
+    $allNonMutating = (-not (@($cmdObjs | Where-Object { $_.mutating -eq $true }).Count -gt 0))
+
+    # Check evidence existence for all 4 records
+    $allEvidenceExist = $true
+    foreach ($co in $cmdObjs) {
+        $outB = [System.IO.Path]::GetFileName($co.stdout_path)
+        $errB = [System.IO.Path]::GetFileName($co.stderr_path)
+        if ($null -eq ($zip.GetEntry("evidence/$outB")) -or $null -eq ($zip.GetEntry("evidence/$errB"))) {
+            $allEvidenceExist = $false
+        }
+    }
+
+    $zip.Dispose()
+    $zipStream.Dispose()
+
+    $journalValid = ($countMatch -and $idsMatch -and $noMutatingAction -and $allNonMutating -and $allEvidenceExist)
+
+    if ($stoppedProperly -and $artExists -and $bundleValid -and $sumMatches -and $journalValid) {
+        Report-Pass 'T105' 'A digest-valid operation that STOPs at a precondition still produces a valid canonical bundle'
+    } else {
+        Report-Fail 'T105' 'A digest-valid operation that STOPs at a precondition still produces a valid canonical bundle' "stopped=$stoppedProperly, artExists=$artExists, bundleValid=$bundleValid, sumMatches=$sumMatches, journalValid=$journalValid (count=$countMatch, ids=$idsMatch, noMut=$noMutatingAction, allNonMut=$allNonMutating, evExist=$allEvidenceExist)"
+    }
+} catch {
+    Report-Fail 'T105' 'A digest-valid operation that STOPs at a precondition still produces a valid canonical bundle' $_.Exception.Message
+} finally {
+    if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
+    if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }
+}
+
+# ----------------------------------------------------
+# T106 — Wrong/malformed authorization digest still launches zero native processes, creates no canonical run artifact, and CLI exposes: ARTIFACT: <none>, ARTIFACT_SHA256: <none> (DEC-003 Phase 2B)
+# ----------------------------------------------------
+try {
+    $repo = New-TestGitRepo 't106'
+    $m = New-TestManifest -RepoDir $repo.RepoDir -HeadSha $repo.HeadSha
+    $cliScript = Join-Path (Split-Path -Parent $scriptDir) 'Invoke-PalkaOperation.ps1'
+
+    $wrongDigest = '0000000000000000000000000000000000000000000000000000000000000000'
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo.FileName = 'powershell.exe'
+    $p.StartInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$cliScript`" -ManifestPath `"$($m.ManifestPath)`" -OutputRoot `"$outputRoot`" -AuthorizedManifestSha256 $wrongDigest"
+    $p.StartInfo.UseShellExecute = $false
+    $p.StartInfo.RedirectStandardOutput = $true
+    $p.StartInfo.RedirectStandardError = $true
+    $p.Start() | Out-Null
+    $outText = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    $exitCode = $p.ExitCode
+
+    $hasArtifactNone = ($outText -match 'ARTIFACT:\s*<none>')
+    $hasShaNone = ($outText -match 'ARTIFACT_SHA256:\s*<none>')
+    $isStopped = ($outText -match 'RESULT:\s*STOPPED')
+    $isNotApplied = ($outText -match 'MUTATION_STATE:\s*NOT_APPLIED')
+
+    if ($exitCode -ne 0 -and $hasArtifactNone -and $hasShaNone -and $isStopped -and $isNotApplied) {
+        Report-Pass 'T106' 'Wrong authorization digest launches zero native processes, creates no canonical run artifact, and CLI exposes <none>'
+    } else {
+        Report-Fail 'T106' 'Wrong authorization digest launches zero native processes, creates no canonical run artifact, and CLI exposes <none>' "exit=$exitCode, artNone=$hasArtifactNone, shaNone=$hasShaNone, stopped=$isStopped"
+    }
+} catch {
+    Report-Fail 'T106' 'Wrong authorization digest launches zero native processes, creates no canonical run artifact, and CLI exposes <none>' $_.Exception.Message
 } finally {
     if ($null -ne $repo) { Remove-TestGitRepo $repo.RepoDir }
     if ($null -ne $m -and (Test-Path $m.ManifestPath)) { Remove-Item -Force $m.ManifestPath }

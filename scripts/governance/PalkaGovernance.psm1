@@ -4,6 +4,10 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+
 # Phase 2A Baseline Stop Conditions
 $PalkaBaselineStopConditions = @(
     'MANIFEST_DIGEST_MISMATCH',
@@ -480,8 +484,8 @@ function Test-PalkaManifestStructure {
         throw [PalkaEngineException]::new('ENGINE_FAILURE', "Unsupported manifest schema: '$($ManifestObject.schema)'")
     }
 
-    if (-not [string]::Equals($ManifestObject.artifact_profile, 'PHASE_2A_RUN_DIRECTORY_V0', [System.StringComparison]::Ordinal)) {
-        throw [PalkaEngineException]::new('ENGINE_FAILURE', "artifact_profile must be 'PHASE_2A_RUN_DIRECTORY_V0', got '$($ManifestObject.artifact_profile)'")
+    if (-not [string]::Equals($ManifestObject.artifact_profile, 'EVIDENCE_BUNDLE_V1', [System.StringComparison]::Ordinal)) {
+        throw [PalkaEngineException]::new('ENGINE_FAILURE', "artifact_profile must be 'EVIDENCE_BUNDLE_V1', got '$($ManifestObject.artifact_profile)'")
     }
 
     # Validate stop_conditions array structure
@@ -1115,16 +1119,25 @@ function Invoke-PalkaEngine {
             throw [PalkaEngineException]::new('POLICY_FAILURE', "OutputRoot ('$canonOutputRoot') must not be equal to or inside working_directory ('$canonWorkDir')")
         }
 
-        # Create run directory and evidence directory outside repository
+        # Create run directory, evidence directory, and patches directory outside repository
         $runDir = Join-Path (Join-Path $canonOutputRoot $operationId) $runId
         New-Item -ItemType Directory -Force -Path $runDir | Out-Null
         $evidenceDir = Join-Path $runDir 'evidence'
         New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+        $patchesDir = Join-Path $runDir 'patches'
+        New-Item -ItemType Directory -Force -Path $patchesDir | Out-Null
 
         # Save byte-exact original manifest
         [System.IO.File]::WriteAllBytes((Join-Path $runDir 'manifest.json'), $rawManifestBytes)
 
         $commandsJournalPath = Join-Path $runDir 'commands.jsonl'
+        # Initialize commands.jsonl as a zero-byte UTF-8/no-BOM file immediately after run-directory creation
+        [System.IO.File]::WriteAllBytes($commandsJournalPath, [byte[]]@())
+
+        $patchPath = Join-Path $patchesDir 'changes.patch'
+        # Initialize patches/changes.patch as zero-byte file
+        [System.IO.File]::WriteAllBytes($patchPath, [byte[]]@())
+
         $summaryPath = Join-Path $runDir 'summary.json'
 
         # Determine initial mutation state after manifest verification
@@ -1362,6 +1375,20 @@ function Invoke-PalkaEngine {
             $engineState.ProvenHead = $finalHeadVal
             $failedCommandId = $null
 
+            # Phase 9.6: Built-in Bundle Patch Capture (read-only journaled builtin command)
+            $failedPhase = 'PATCH_CAPTURE'
+            $failedCommandId = 'builtin-bundle-patch'
+            $patchProc = & $executeJournaledProcess -CommandId 'builtin-bundle-patch' -Phase 'PATCH_CAPTURE' -Executable 'git' -Arguments @('diff', '--binary', '--no-ext-diff', '--no-renames', '--') -Cwd $workDir -Mutating $false -Expect ([PSCustomObject]@{ exit_code = 0 })
+            $failedCommandId = $null
+            $failedPhase = $null
+
+            $seqStr = "{0:D3}" -f $engineState.Sequence
+            $bundlePatchStdout = Join-Path $evidenceDir "$seqStr-builtin-bundle-patch-stdout.txt"
+            if (Test-Path -LiteralPath $bundlePatchStdout) {
+                $rawStdoutBytes = [System.IO.File]::ReadAllBytes($bundlePatchStdout)
+                [System.IO.File]::WriteAllBytes($patchPath, $rawStdoutBytes)
+            }
+
             # All phases completed successfully
             $result = 'COMPLETED'
             if ($isPotentiallyMutating) {
@@ -1428,14 +1455,514 @@ function Invoke-PalkaEngine {
         catch {
             # R2-13: If summary cannot be written, result remains STOPPED
             $summaryObj.result = 'STOPPED'
+            $summaryObj.failed_phase = 'SUMMARY_GENERATION'
             $summaryObj.reason = "Failed to write summary.json: $($_.Exception.Message)"
         }
     }
+
+    # Canonical Evidence Bundle V1 Finalization
+    $artifactPath = $null
+    $artifactSha256 = $null
+
+    if ($null -ne $runDir -and (Test-Path -LiteralPath $runDir)) {
+        $finalArtifactPath = Join-Path $runDir 'artifact.zip'
+        try {
+            $checksumsPath = Join-Path $runDir 'checksums.sha256'
+
+            # 1. Enumerate all regular files in $runDir except checksums.sha256, artifact.zip, *.tmp
+            $allRunFiles = [System.IO.Directory]::GetFiles($runDir, '*', [System.IO.SearchOption]::AllDirectories)
+            $bundleFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+
+            # Canonical allowlist for regular files in run directory
+            foreach ($filePath in $allRunFiles) {
+                $relPath = $filePath.Substring($runDir.Length).TrimStart([char]92, [char]47).Replace([char]92, [char]47)
+                if ([string]::Equals($relPath, 'checksums.sha256', [System.StringComparison]::Ordinal) -or
+                    [string]::Equals($relPath, 'artifact.zip', [System.StringComparison]::Ordinal) -or
+                    $relPath.EndsWith('.tmp', [System.StringComparison]::Ordinal)) {
+                    continue
+                }
+
+                $isCanonical = [string]::Equals($relPath, 'manifest.json', [System.StringComparison]::Ordinal) -or
+                               [string]::Equals($relPath, 'summary.json', [System.StringComparison]::Ordinal) -or
+                               [string]::Equals($relPath, 'commands.jsonl', [System.StringComparison]::Ordinal) -or
+                               [string]::Equals($relPath, 'patches/changes.patch', [System.StringComparison]::Ordinal) -or
+                               $relPath.StartsWith('evidence/', [System.StringComparison]::Ordinal)
+
+                if (-not $isCanonical) {
+                    throw [PalkaEngineException]::new('EVIDENCE_BUNDLE_FAILURE', "Unexpected non-canonical regular file in run directory: '$relPath'")
+                }
+
+                # Check dot segments
+                $segments = $relPath.Split('/')
+                foreach ($seg in $segments) {
+                    if ([string]::Equals($seg, '.', [System.StringComparison]::Ordinal) -or [string]::Equals($seg, '..', [System.StringComparison]::Ordinal)) {
+                        throw [PalkaEngineException]::new('EVIDENCE_BUNDLE_FAILURE', "Run directory file contains dot path segment ('.' or '..'): '$relPath'")
+                    }
+                }
+
+                $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+                $hashBytes = $shaAlgo.ComputeHash($fileBytes)
+                $hexHash = (($hashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+                $bundleFiles.Add([PSCustomObject]@{
+                    RelativePath = $relPath
+                    FullPath = $filePath
+                    Bytes = $fileBytes
+                    Hash = $hexHash
+                })
+            }
+
+            # Sort bundle files ordinally by relative path using System.StringComparer.Ordinal
+            $bundleFilesArray = $bundleFiles.ToArray()
+            [System.Array]::Sort($bundleFilesArray, [System.Collections.Generic.Comparer[PSCustomObject]]::Create({
+                param($a, $b)
+                [System.StringComparer]::Ordinal.Compare($a.RelativePath, $b.RelativePath)
+            }))
+
+            # Generate checksums.sha256 lines: lowercase hex, two spaces, relative path, LF
+            $checksumLines = [System.Collections.Generic.List[string]]::new()
+            foreach ($bf in $bundleFilesArray) {
+                $checksumLines.Add("$($bf.Hash)  $($bf.RelativePath)")
+            }
+            $checksumsContent = ($checksumLines -join "`n") + "`n"
+            $checksumsBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($checksumsContent)
+            [System.IO.File]::WriteAllBytes($checksumsPath, $checksumsBytes)
+
+            # 2. Build canonical artifact.zip via temp archive
+            $tempZipPath = Join-Path $env:TEMP "palka-bundle-$([Guid]::NewGuid().ToString('N')).tmp"
+            if (Test-Path -LiteralPath $tempZipPath) {
+                Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue
+            }
+
+            # Archive file list includes checksums.sha256
+            $archiveFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($bf in $bundleFilesArray) {
+                $archiveFiles.Add($bf)
+            }
+            $checksumsHashBytes = $shaAlgo.ComputeHash($checksumsBytes)
+            $checksumsHexHash = (($checksumsHashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+            $archiveFiles.Add([PSCustomObject]@{
+                RelativePath = 'checksums.sha256'
+                FullPath = $checksumsPath
+                Bytes = $checksumsBytes
+                Hash = $checksumsHexHash
+            })
+
+            $archiveFilesArray = $archiveFiles.ToArray()
+            [System.Array]::Sort($archiveFilesArray, [System.Collections.Generic.Comparer[PSCustomObject]]::Create({
+                param($a, $b)
+                [System.StringComparer]::Ordinal.Compare($a.RelativePath, $b.RelativePath)
+            }))
+
+            $fixedZipTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+
+            $zipStream = [System.IO.File]::Open($tempZipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $zipArchive = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+
+            try {
+                foreach ($af in $archiveFilesArray) {
+                    $entry = $zipArchive.CreateEntry($af.RelativePath, [System.IO.Compression.CompressionLevel]::Optimal)
+                    $entry.LastWriteTime = $fixedZipTime
+                    $entryStream = $entry.Open()
+                    try {
+                        $entryStream.Write($af.Bytes, 0, $af.Bytes.Length)
+                    }
+                    finally {
+                        $entryStream.Dispose()
+                    }
+                }
+            }
+            finally {
+                $zipArchive.Dispose()
+                $zipStream.Dispose()
+            }
+
+            # Atomically move temp zip to final destination
+            if (Test-Path -LiteralPath $finalArtifactPath) {
+                Remove-Item -LiteralPath $finalArtifactPath -Force -ErrorAction SilentlyContinue
+            }
+            [System.IO.File]::Move($tempZipPath, $finalArtifactPath)
+
+            # Mandatory Engine Self-Verification
+            $selfVerificationPassed = $false
+            try {
+                $selfVerificationPassed = Test-PalkaEvidenceBundle -ArtifactPath $finalArtifactPath
+            }
+            catch {
+                throw [PalkaEngineException]::new('EVIDENCE_BUNDLE_FAILURE', "Engine self-verification rejected candidate bundle: $($_.Exception.Message)")
+            }
+
+            if ($selfVerificationPassed -ne $true) {
+                throw [PalkaEngineException]::new('EVIDENCE_BUNDLE_FAILURE', "Engine self-verification failed: Test-PalkaEvidenceBundle did not return true")
+            }
+
+            # Compute SHA-256 over verified closed final artifact.zip bytes
+            $finalZipBytes = [System.IO.File]::ReadAllBytes($finalArtifactPath)
+            $zipHashBytes = $shaAlgo.ComputeHash($finalZipBytes)
+            $artifactSha256 = (($zipHashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+            $artifactPath = $finalArtifactPath
+        }
+        catch {
+            # EVIDENCE_BUNDLE_FINALIZATION failure
+            $summaryObj.result = 'STOPPED'
+            $summaryObj.failed_phase = 'EVIDENCE_BUNDLE_FINALIZATION'
+            $summaryObj.reason = "EVIDENCE_BUNDLE_FAILURE: $($_.Exception.Message)"
+            $artifactPath = $null
+            $artifactSha256 = $null
+
+            if (Test-Path -LiteralPath $finalArtifactPath) {
+                try {
+                    [System.IO.File]::Delete($finalArtifactPath)
+                }
+                catch {}
+            }
+
+            # Rewrite summary.json
+            try {
+                $summaryJson = $summaryObj | ConvertTo-Json -Depth 5
+                [System.IO.File]::WriteAllText($summaryPath, $summaryJson, [System.Text.UTF8Encoding]::new($false))
+            }
+            catch {}
+        }
+    }
+
+    # Add helper properties for CLI and in-memory callers
+    $summaryObj | Add-Member -NotePropertyName artifact_path -NotePropertyValue $artifactPath -Force
+    $summaryObj | Add-Member -NotePropertyName artifact_sha256 -NotePropertyValue $artifactSha256 -Force
 
     if ($PassThru) {
         return $summaryObj
     }
     return $summaryPath
+}
+
+function Test-PalkaEvidenceBundle {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ArtifactPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
+        throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Artifact path does not exist or is not a file: '$ArtifactPath'")
+    }
+
+    $zipBytes = [System.IO.File]::ReadAllBytes($ArtifactPath)
+    $memStream = [System.IO.MemoryStream]::new($zipBytes)
+    $archive = $null
+
+    try {
+        $archive = [System.IO.Compression.ZipArchive]::new($memStream, [System.IO.Compression.ZipArchiveMode]::Read)
+    }
+    catch {
+        throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Failed to open ZIP archive: $($_.Exception.Message)")
+    }
+
+    try {
+        $seenEntryNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $entryMap = [System.Collections.Generic.Dictionary[string, [System.IO.Compression.ZipArchiveEntry]]]::new([System.StringComparer]::Ordinal)
+
+        foreach ($entry in $archive.Entries) {
+            $name = $entry.FullName
+
+            # Reject directory entries
+            if ($name.EndsWith('/') -or $entry.Name.Length -eq 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry is a directory: '$name'")
+            }
+
+            # Safety checks
+            if ($name.IndexOf([char]92) -ge 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry name contains backslash: '$name'")
+            }
+            if ($name.StartsWith('/')) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry name has leading slash: '$name'")
+            }
+            if ($name.IndexOf('//', [System.StringComparison]::Ordinal) -ge 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry name contains empty path segment: '$name'")
+            }
+            if ($name -cmatch '^[A-Za-z]:') {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry name contains drive prefix: '$name'")
+            }
+
+            # Check dot path segments
+            $segments = $name.Split('/')
+            foreach ($seg in $segments) {
+                if ([string]::Equals($seg, '.', [System.StringComparison]::Ordinal) -or [string]::Equals($seg, '..', [System.StringComparison]::Ordinal)) {
+                    throw [PalkaEngineException]::new('VERIFIER_FAILURE', "ZIP entry name contains invalid path segment ('.' or '..'): '$name'")
+                }
+            }
+
+            if ($seenEntryNames.Contains($name)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Duplicate ZIP entry name: '$name'")
+            }
+
+            # Canonical Entry Allowlist (Exact Ordinal Case)
+            $isCanonical = [string]::Equals($name, 'manifest.json', [System.StringComparison]::Ordinal) -or
+                           [string]::Equals($name, 'summary.json', [System.StringComparison]::Ordinal) -or
+                           [string]::Equals($name, 'commands.jsonl', [System.StringComparison]::Ordinal) -or
+                           [string]::Equals($name, 'checksums.sha256', [System.StringComparison]::Ordinal) -or
+                           [string]::Equals($name, 'patches/changes.patch', [System.StringComparison]::Ordinal) -or
+                           $name.StartsWith('evidence/', [System.StringComparison]::Ordinal)
+
+            if (-not $isCanonical) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Non-canonical ZIP entry forbidden in Evidence Bundle: '$name'")
+            }
+
+            $seenEntryNames.Add($name) | Out-Null
+            $entryMap[$name] = $entry
+        }
+
+        # Required root entries (Exact Ordinal)
+        $requiredEntries = @('manifest.json', 'summary.json', 'commands.jsonl', 'checksums.sha256', 'patches/changes.patch')
+        foreach ($req in $requiredEntries) {
+            if (-not $entryMap.ContainsKey($req)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Missing required bundle entry: '$req'")
+            }
+        }
+
+        if ($entryMap.ContainsKey('artifact.zip')) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Nested artifact.zip forbidden inside bundle")
+        }
+
+        # Check BOM on checksums.sha256
+        $csStreamBOM = $entryMap['checksums.sha256'].Open()
+        $b1 = $csStreamBOM.ReadByte()
+        $b2 = $csStreamBOM.ReadByte()
+        $b3 = $csStreamBOM.ReadByte()
+        $csStreamBOM.Dispose()
+        if ($b1 -eq 0xEF -and $b2 -eq 0xBB -and $b3 -eq 0xBF) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 must not have UTF-8 BOM")
+        }
+
+        # Read checksums.sha256 text
+        $csStream = $entryMap['checksums.sha256'].Open()
+        $csReader = [System.IO.StreamReader]::new($csStream, [System.Text.UTF8Encoding]::new($false, $true))
+        $checksumText = $csReader.ReadToEnd()
+        $csReader.Dispose()
+        $csStream.Dispose()
+
+        if ($checksumText.Contains("`r")) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 contains CRLF line endings")
+        }
+        if (-not $checksumText.EndsWith("`n")) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 must end with final LF")
+        }
+
+        $lines = $checksumText.TrimEnd("`n").Split("`n")
+        $checksumPaths = [System.Collections.Generic.List[string]]::new()
+        $checksumMap = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+
+        foreach ($line in $lines) {
+            if ($line.Length -eq 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 contains empty line")
+            }
+            # Case-sensitive lowercase hex checksum line syntax validation
+            if ($line -cnotmatch '^([0-9a-f]{64})  ([^\s].*)$') {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Malformed checksum line: '$line'")
+            }
+            $hash = $Matches[1]
+            $p = $Matches[2]
+
+            if ([string]::Equals($p, 'checksums.sha256', [System.StringComparison]::Ordinal) -or
+                [string]::Equals($p, 'artifact.zip', [System.StringComparison]::Ordinal)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 must not contain '$p'")
+            }
+            if ($p.IndexOf([char]92) -ge 0 -or $p.StartsWith('/') -or $p.IndexOf('//', [System.StringComparison]::Ordinal) -ge 0 -or $p -cmatch '^[A-Za-z]:') {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Unsafe path in checksums: '$p'")
+            }
+
+            # Check dot path segments in checksum paths
+            $csSegments = $p.Split('/')
+            foreach ($cseg in $csSegments) {
+                if ([string]::Equals($cseg, '.', [System.StringComparison]::Ordinal) -or [string]::Equals($cseg, '..', [System.StringComparison]::Ordinal)) {
+                    throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Checksum path contains invalid path segment ('.' or '..'): '$p'")
+                }
+            }
+
+            $isCanonicalChecksumPath = [string]::Equals($p, 'manifest.json', [System.StringComparison]::Ordinal) -or
+                                        [string]::Equals($p, 'summary.json', [System.StringComparison]::Ordinal) -or
+                                        [string]::Equals($p, 'commands.jsonl', [System.StringComparison]::Ordinal) -or
+                                        [string]::Equals($p, 'patches/changes.patch', [System.StringComparison]::Ordinal) -or
+                                        $p.StartsWith('evidence/', [System.StringComparison]::Ordinal)
+
+            if (-not $isCanonicalChecksumPath) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Non-canonical path in checksums.sha256: '$p'")
+            }
+
+            if ($checksumMap.ContainsKey($p)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Duplicate path in checksums: '$p'")
+            }
+            $checksumMap[$p] = $hash
+            $checksumPaths.Add($p)
+        }
+
+        # Verify sorted order using Ordinal
+        for ($i = 0; $i -lt $checksumPaths.Count - 1; $i++) {
+            if ([System.StringComparer]::Ordinal.Compare($checksumPaths[$i], $checksumPaths[$i + 1]) -ge 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "checksums.sha256 paths are not sorted in strict ordinal order ('$($checksumPaths[$i])' before '$($checksumPaths[$i+1])')")
+            }
+        }
+
+        # Check coverage: every entry in archive except checksums.sha256 must be in checksumMap and vice-versa
+        $expectedEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($k in $entryMap.Keys) {
+            if (-not [string]::Equals($k, 'checksums.sha256', [System.StringComparison]::Ordinal)) {
+                $expectedEntries.Add($k) | Out-Null
+            }
+        }
+
+        foreach ($k in $checksumMap.Keys) {
+            if (-not $expectedEntries.Contains($k)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Checksum entry '$k' does not exist in archive")
+            }
+        }
+        foreach ($k in $expectedEntries) {
+            if (-not $checksumMap.ContainsKey($k)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Archive entry '$k' has no corresponding entry in checksums.sha256")
+            }
+        }
+
+        # Verify actual hash of every entry directly from stream
+        $shaAlgo = [System.Security.Cryptography.SHA256]::Create()
+        foreach ($k in $expectedEntries) {
+            $eStream = $entryMap[$k].Open()
+            $hBytes = $shaAlgo.ComputeHash($eStream)
+            $eStream.Dispose()
+            $actualHash = (($hBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+            $expectedHash = $checksumMap[$k]
+            if (-not [string]::Equals($actualHash, $expectedHash, [System.StringComparison]::Ordinal)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Checksum mismatch for entry '$k': expected '$expectedHash', calculated '$actualHash'")
+            }
+        }
+
+        # Validate manifest.json
+        $mStream = $entryMap['manifest.json'].Open()
+        $mReader = [System.IO.StreamReader]::new($mStream, [System.Text.UTF8Encoding]::new($false, $true))
+        $manifestText = $mReader.ReadToEnd()
+        $mReader.Dispose()
+        $mStream.Dispose()
+
+        $manifestObj = $null
+        try {
+            $manifestObj = $manifestText | ConvertFrom-Json
+        }
+        catch {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Malformed JSON in manifest.json: $($_.Exception.Message)")
+        }
+        Test-PalkaManifestStructure -ManifestObject $manifestObj
+
+        # Validate summary.json
+        $sStream = $entryMap['summary.json'].Open()
+        $sReader = [System.IO.StreamReader]::new($sStream, [System.Text.UTF8Encoding]::new($false, $true))
+        $summaryText = $sReader.ReadToEnd()
+        $sReader.Dispose()
+        $sStream.Dispose()
+
+        $summaryObj = $null
+        try {
+            $summaryObj = $summaryText | ConvertFrom-Json
+        }
+        catch {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Malformed JSON in summary.json: $($_.Exception.Message)")
+        }
+
+        # Exact Ordinal Summary/Manifest Identity
+        if (-not [string]::Equals([string]$summaryObj.operation_id, [string]$manifestObj.operation_id, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.operation_id ('$($summaryObj.operation_id)') does not match manifest.operation_id ('$($manifestObj.operation_id)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.repository, [string]$manifestObj.repository, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.repository ('$($summaryObj.repository)') does not match manifest.repository ('$($manifestObj.repository)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.working_directory, [string]$manifestObj.working_directory, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.working_directory ('$($summaryObj.working_directory)') does not match manifest.working_directory ('$($manifestObj.working_directory)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.stage, [string]$manifestObj.stage, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.stage ('$($summaryObj.stage)') does not match manifest.stage ('$($manifestObj.stage)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.expected_start_branch, [string]$manifestObj.expected_start_branch, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.expected_start_branch ('$($summaryObj.expected_start_branch)') does not match manifest.expected_start_branch ('$($manifestObj.expected_start_branch)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.target_branch, [string]$manifestObj.target_branch, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.target_branch ('$($summaryObj.target_branch)') does not match manifest.target_branch ('$($manifestObj.target_branch)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.expected_head, [string]$manifestObj.expected_head, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.expected_head ('$($summaryObj.expected_head)') does not match manifest.expected_head ('$($manifestObj.expected_head)') (Ordinal mismatch)")
+        }
+        if (-not [string]::Equals([string]$summaryObj.expected_base, [string]$manifestObj.expected_base, [System.StringComparison]::Ordinal)) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.expected_base ('$($summaryObj.expected_base)') does not match manifest.expected_base ('$($manifestObj.expected_base)') (Ordinal mismatch)")
+        }
+
+        # summary.command_count must be an actual JSON integer representation
+        if ($summaryObj.command_count -isnot [int] -and $summaryObj.command_count -isnot [long]) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.command_count is not an integer type")
+        }
+
+        # Validate commands.jsonl
+        $cmdStream = $entryMap['commands.jsonl'].Open()
+        $cmdReader = [System.IO.StreamReader]::new($cmdStream, [System.Text.UTF8Encoding]::new($false, $true))
+        $commandsText = $cmdReader.ReadToEnd()
+        $cmdReader.Dispose()
+        $cmdStream.Dispose()
+
+        $commandLines = if ($commandsText.Length -gt 0) { $commandsText.TrimEnd("`n").Split("`n") } else { @() }
+        if ($commandsText.Length -eq 0) {
+            $commandLines = @()
+        }
+
+        if ($commandLines.Count -ne $summaryObj.command_count) {
+            throw [PalkaEngineException]::new('VERIFIER_FAILURE', "summary.command_count ($($summaryObj.command_count)) does not match line count in commands.jsonl ($($commandLines.Count))")
+        }
+
+        foreach ($cline in $commandLines) {
+            $rec = $null
+            try {
+                $rec = $cline | ConvertFrom-Json
+            }
+            catch {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Malformed JSONL in commands.jsonl: '$cline'")
+            }
+
+            # Mandatory command evidence paths
+            $recProps = @($rec.PSObject.Properties.Name)
+            if (-not ($recProps -contains 'stdout_path')) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "commands.jsonl record missing stdout_path property")
+            }
+            if (-not ($recProps -contains 'stderr_path')) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "commands.jsonl record missing stderr_path property")
+            }
+
+            if ($rec.stdout_path -isnot [string] -or [string]::IsNullOrWhiteSpace($rec.stdout_path)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "commands.jsonl record has invalid or empty stdout_path")
+            }
+            if ($rec.stderr_path -isnot [string] -or [string]::IsNullOrWhiteSpace($rec.stderr_path)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "commands.jsonl record has invalid or empty stderr_path")
+            }
+
+            $outBase = [System.IO.Path]::GetFileName($rec.stdout_path)
+            if ([string]::IsNullOrEmpty($outBase) -or [string]::Equals($outBase, '.', [System.StringComparison]::Ordinal) -or [string]::Equals($outBase, '..', [System.StringComparison]::Ordinal) -or $outBase.IndexOfAny(@([char]92, [char]47)) -ge 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Unsafe stdout_path basename in commands.jsonl: '$($rec.stdout_path)'")
+            }
+            $evStdoutEntry = "evidence/$outBase"
+            if (-not $entryMap.ContainsKey($evStdoutEntry)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Command stdout evidence entry missing from archive: '$evStdoutEntry'")
+            }
+
+            $errBase = [System.IO.Path]::GetFileName($rec.stderr_path)
+            if ([string]::IsNullOrEmpty($errBase) -or [string]::Equals($errBase, '.', [System.StringComparison]::Ordinal) -or [string]::Equals($errBase, '..', [System.StringComparison]::Ordinal) -or $errBase.IndexOfAny(@([char]92, [char]47)) -ge 0) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Unsafe stderr_path basename in commands.jsonl: '$($rec.stderr_path)'")
+            }
+            $evStderrEntry = "evidence/$errBase"
+            if (-not $entryMap.ContainsKey($evStderrEntry)) {
+                throw [PalkaEngineException]::new('VERIFIER_FAILURE', "Command stderr evidence entry missing from archive: '$evStderrEntry'")
+            }
+        }
+
+        return $true
+    }
+    finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        $memStream.Dispose()
+    }
 }
 
 Export-ModuleMember -Function @(
@@ -1444,5 +1971,6 @@ Export-ModuleMember -Function @(
     'Format-PalkaProcessArgument',
     'Test-PalkaDangerousPolicy',
     'Test-PalkaRefreshPolicy',
-    'Get-PalkaPorcelainZPaths'
+    'Get-PalkaPorcelainZPaths',
+    'Test-PalkaEvidenceBundle'
 )

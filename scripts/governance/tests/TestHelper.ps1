@@ -156,7 +156,7 @@ function New-TestManifest {
         already_satisfied_checks = @()
         authorized_commands = @()
         required_postconditions = @()
-        artifact_profile = 'PHASE_2A_RUN_DIRECTORY_V0'
+        artifact_profile = 'EVIDENCE_BUNDLE_V1'
         stop_conditions = @(
             'MANIFEST_DIGEST_MISMATCH',
             'PRECONDITION_MISMATCH',
