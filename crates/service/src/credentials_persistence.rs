@@ -5,6 +5,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::STANDARD_NO_PAD as BASE64_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -72,6 +73,50 @@ struct CredentialsWireV1 {
     telegram_bot_token_dpapi: String,
 }
 
+fn validate_phc_base64(raw: &str, field_name: &str) -> Result<(), CredentialsPersistenceError> {
+    if raw.is_empty() {
+        return Err(CredentialsPersistenceError::Validation(format!(
+            "pin_hash PHC {field_name} component cannot be empty"
+        )));
+    }
+
+    if raw.contains('=') {
+        return Err(CredentialsPersistenceError::Validation(format!(
+            "pin_hash PHC {field_name} must use unpadded Base64 without '='"
+        )));
+    }
+
+    if raw
+        .chars()
+        .any(|c| c.is_whitespace() || c == '\r' || c == '\n')
+    {
+        return Err(CredentialsPersistenceError::Validation(format!(
+            "pin_hash PHC {field_name} contains whitespace or newline characters"
+        )));
+    }
+
+    let decoded = BASE64_NO_PAD.decode(raw).map_err(|e| {
+        CredentialsPersistenceError::Validation(format!(
+            "invalid Base64 in pin_hash PHC {field_name}: {e}"
+        ))
+    })?;
+
+    if decoded.is_empty() {
+        return Err(CredentialsPersistenceError::Validation(format!(
+            "decoded pin_hash PHC {field_name} is empty"
+        )));
+    }
+
+    let canonical = BASE64_NO_PAD.encode(&decoded);
+    if canonical != raw {
+        return Err(CredentialsPersistenceError::Validation(format!(
+            "pin_hash PHC {field_name} is not canonically unpadded Base64"
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_pin_hash(pin_hash: &str) -> Result<(), CredentialsPersistenceError> {
     if pin_hash.is_empty() {
         return Err(CredentialsPersistenceError::Validation(
@@ -79,36 +124,89 @@ fn validate_pin_hash(pin_hash: &str) -> Result<(), CredentialsPersistenceError> 
         ));
     }
 
-    // Must be in Argon2id PHC format starting with $argon2id$
     if !pin_hash.starts_with("$argon2id$") {
         return Err(CredentialsPersistenceError::Validation(
             "pin_hash must be a valid Argon2id PHC string starting with '$argon2id$'".to_string(),
         ));
     }
 
-    // Split by '$': ["", "argon2id", ... params ..., salt, hash]
+    // Split by '$': ["", "argon2id", "v=19", "m=...,t=...,p=...", "<salt>", "<hash>"]
     let parts: Vec<&str> = pin_hash.split('$').collect();
-    if parts.len() < 5 {
+    if parts.len() != 6 {
         return Err(CredentialsPersistenceError::Validation(
-            "pin_hash is missing required PHC components (parameters, salt, or hash)".to_string(),
+            "pin_hash must contain exactly 5 non-empty '$'-separated components ($argon2id$v=19$m=...,t=...,p=...$salt$hash)".to_string(),
         ));
     }
 
-    // Leading part before the first '$' must be empty
-    if !parts[0].is_empty() || parts[1] != "argon2id" {
+    if !parts[0].is_empty() {
         return Err(CredentialsPersistenceError::Validation(
-            "pin_hash has invalid PHC format".to_string(),
+            "pin_hash must start with leading '$'".to_string(),
         ));
     }
 
-    // All intermediate and trailing components must be non-empty
-    for (idx, part) in parts.iter().enumerate().skip(1) {
-        if part.is_empty() {
-            return Err(CredentialsPersistenceError::Validation(format!(
-                "pin_hash PHC component at index {idx} is empty"
-            )));
-        }
+    if parts[1] != "argon2id" {
+        return Err(CredentialsPersistenceError::Validation(
+            "pin_hash algorithm identifier must be 'argon2id'".to_string(),
+        ));
     }
+
+    if parts[2] != "v=19" {
+        return Err(CredentialsPersistenceError::Validation(
+            "pin_hash version must be 'v=19'".to_string(),
+        ));
+    }
+
+    // Parameter segment: m=<decimal>,t=<decimal>,p=<decimal>
+    let param_parts: Vec<&str> = parts[3].split(',').collect();
+    if param_parts.len() != 3 {
+        return Err(CredentialsPersistenceError::Validation(
+            "pin_hash parameters must contain exactly 3 comma-separated parameters in canonical order: m=...,t=...,p=...".to_string(),
+        ));
+    }
+
+    let m_str = param_parts[0].strip_prefix("m=").ok_or_else(|| {
+        CredentialsPersistenceError::Validation(
+            "pin_hash first parameter must be 'm=<decimal>'".to_string(),
+        )
+    })?;
+    let t_str = param_parts[1].strip_prefix("t=").ok_or_else(|| {
+        CredentialsPersistenceError::Validation(
+            "pin_hash second parameter must be 't=<decimal>'".to_string(),
+        )
+    })?;
+    let p_str = param_parts[2].strip_prefix("p=").ok_or_else(|| {
+        CredentialsPersistenceError::Validation(
+            "pin_hash third parameter must be 'p=<decimal>'".to_string(),
+        )
+    })?;
+
+    let parse_positive_u32 =
+        |val_str: &str, name: &str| -> Result<u32, CredentialsPersistenceError> {
+            if val_str.is_empty() || !val_str.chars().all(|c| c.is_ascii_digit()) {
+                return Err(CredentialsPersistenceError::Validation(format!(
+                    "pin_hash parameter '{name}' must be a non-empty unsigned decimal integer"
+                )));
+            }
+            let val: u32 = val_str.parse().map_err(|_| {
+                CredentialsPersistenceError::Validation(format!(
+                    "pin_hash parameter '{name}' exceeds u32 range or is invalid"
+                ))
+            })?;
+            if val == 0 {
+                return Err(CredentialsPersistenceError::Validation(format!(
+                    "pin_hash parameter '{name}' must be greater than zero"
+                )));
+            }
+            Ok(val)
+        };
+
+    parse_positive_u32(m_str, "m")?;
+    parse_positive_u32(t_str, "t")?;
+    parse_positive_u32(p_str, "p")?;
+
+    // Salt and hash validation
+    validate_phc_base64(parts[4], "salt")?;
+    validate_phc_base64(parts[5], "hash")?;
 
     Ok(())
 }
@@ -431,17 +529,47 @@ mod tests {
     }
 
     #[test]
+    fn phc_exact_rejection_test_cases() {
+        let b64 = BASE64_STANDARD.encode(SAMPLE_DPAPI_BLOB);
+
+        let test_cases = &[
+            "$argon2id$garbage$salt$hash",
+            "$argon2id$v=18$m=65536,t=3,p=4$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536,t=3$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA$extra",
+            "$argon2id$v=19$m=x,t=3,p=4$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536,t=0,p=4$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536,t=3,p=4,extra=1$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=65536,t=3,p=4$bad!salt$aGFzaA",
+            "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$bad!hash",
+            "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA==$aGFzaA==",
+        ];
+
+        for phc in test_cases {
+            let json = format!(
+                r#"{{"schema_version":1,"pin_hash":"{phc}","telegram_bot_token_dpapi":"{b64}"}}"#
+            );
+            let err = decode_credentials_json(&json).unwrap_err();
+            assert!(
+                matches!(err, CredentialsPersistenceError::Validation(_)),
+                "Expected Validation error for invalid PHC '{phc}', got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_incomplete_argon2id_phc_shape_rejected() {
         let b64 = BASE64_STANDARD.encode(SAMPLE_DPAPI_BLOB);
 
         let malformed_phcs = &[
             "$argon2id$",
-            "$argon2i$v=19$m=65536,t=3,p=4$salt$hash", // wrong algorithm (argon2i)
-            "$argon2d$v=19$m=65536,t=3,p=4$salt$hash", // wrong algorithm (argon2d)
-            "$argon2id$v=19$m=65536",                  // missing salt and hash
-            "$argon2id$v=19$m=65536$$hash",            // empty salt component
-            "$argon2id$v=19$m=65536$salt$",            // empty hash component
-            "argon2id$v=19$m=65536$salt$hash",         // missing leading $
+            "$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // wrong algorithm (argon2i)
+            "$argon2d$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // wrong algorithm (argon2d)
+            "$argon2id$v=19$m=65536",                       // missing salt and hash
+            "$argon2id$v=19$m=65536$$aGFzaA",               // empty salt component
+            "$argon2id$v=19$m=65536$c2FsdA$",               // empty hash component
+            "argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // missing leading $
         ];
 
         for phc in malformed_phcs {
