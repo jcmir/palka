@@ -258,7 +258,7 @@
 
 | Идентификатор | Описание верифицируемого требования | Уровень свидетельства |
 |---|---|---|
-| **SCM-01** | Канонические имена (`SERVICE_NAME`, `SERVICE_DISPLAY_NAME`, `SERVICE_DESCRIPTION = "PALKA parental control enforcement service"`), тип `SERVICE_WIN32_OWN_PROCESS`, учетная запись `LocalSystem`. | V1 / V2 (Contract/Unit) |
+| **SCM-01** | Канонические имена (`SERVICE_NAME`, `SERVICE_DISPLAY_NAME`, `SERVICE_DESCRIPTION = "PALKA parental control enforcement service"`), тип `SERVICE_WIN32_OWN_PROCESS`, учетная запись `LocalSystem`. | V1 / V2 / V3 |
 | **SCM-02** | Точный профиль запуска: `SERVICE_AUTO_START`, отложенный автозапуск отключен (`DelayedAutostart = false`), `dwErrorControl = SERVICE_ERROR_NORMAL`, зависимости отсутствуют (`Dependencies = NONE`). | V1 / V2 / V3 |
 | **SCM-03** | Точные параметры восстановления: период сброса 86400 с, задержки рестарта 5 с / 15 с / 60 с (с повторением 60 с для сбоев N >= 3), флаг `fFailureActionsOnNonCrashFailures = FALSE` с учетом семантики активации после следующего старта ОС. | V1 / V2 / V3 |
 | **SCM-04** | Отсутствие действия перезагрузки ОС (`SC_ACTION_REBOOT`) в конфигурации восстановления. | V1 / V2 / V3 |

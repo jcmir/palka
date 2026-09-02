@@ -208,18 +208,24 @@
 
 Нормативные требования интеграции со службами Windows определены матрицей `SCM-01`..`SCM-20` в [docs/014-service-lifecycle-contract.md](014-service-lifecycle-contract.md). В рамках будущих этапов верификации уровней V3 (интеграционное тестирование платформы) и V4 (приемочное тестирование безопасности и надежности) фиксируются следующие обязательные сценарии:
 
-1. **Запрос и валидация канонической конфигурации SCM (Query Canonical Config)** (`SCM-01`, `SCM-02`, `SCM-06`, `SCM-07`):
-   * Вызов `QueryServiceConfigW` и `QueryServiceConfig2W` для подтверждения сохраненной конфигурации:
-     * `SERVICE_NAME`: `PalkaService`;
-     * `SERVICE_DISPLAY_NAME`: `PALKA Service`;
-     * `QueryServiceConfig2W` (уровень `SERVICE_CONFIG_DESCRIPTION`): строго `PALKA parental control enforcement service`;
-     * `SERVICE_TYPE`: `SERVICE_WIN32_OWN_PROCESS`;
-     * Учетная запись: `LocalSystem` (`NT AUTHORITY\SYSTEM`);
-     * Тип запуска: `SERVICE_AUTO_START`;
-     * `QueryServiceConfig2W` (уровень `SERVICE_CONFIG_DELAYED_AUTO_START_INFO`): отложенный автозапуск отключен (`fDelayedAutostart = FALSE`);
-     * Контроль ошибок: `SERVICE_ERROR_NORMAL`;
-     * Зависимости: `NONE` (пустой список зависимостей);
-     * Бинарный путь: абсолютный путь к `palka-service.exe`, корректно экранирован двойными кавычками при наличии пробелов, без командных оболочек (`cmd.exe`, `powershell.exe`) и произвольных аргументов.
+1. **Запрос и валидация канонической конфигурации и идентификации SCM (Query Canonical Config & Identity)** (`SCM-01`, `SCM-02`, `SCM-06`, `SCM-07`):
+   * **Идентификация имени службы (Service Key Name Proof)**:
+     * Вызов `OpenServiceW` с `lpServiceName = "PalkaService"` открывает целевой объект службы, однако сравнение имен в SCM регистронезависимо;
+     * Для точного подтверждения сохраненного канонического имени ключа службы (`SERVICE_NAME`) вызывается Win32 API, возвращающий фактическое имя службы:
+       * Предпочтительный метод: `GetServiceKeyNameW` с отображаемым именем `"PALKA Service"` детерминированно возвращает точное имя ключа `"PalkaService"`;
+       * Допустимый альтернативный метод: `EnumServicesStatusExW`, где поле `lpServiceName` целевой записи службы строго равно `"PalkaService"`.
+   * **Валидация базовой конфигурации (`QueryServiceConfigW`)**:
+     * Отображаемое имя (`lpDisplayName`): `PALKA Service`;
+     * Тип службы (`dwServiceType`): `SERVICE_WIN32_OWN_PROCESS`;
+     * Учетная запись запуска (`lpServiceStartName`): `LocalSystem`;
+     * Тип запуска (`dwStartType`): `SERVICE_AUTO_START`;
+     * Контроль ошибок (`dwErrorControl`): `SERVICE_ERROR_NORMAL`;
+     * Зависимости (`lpDependencies`): `NONE` (пустой буфер / пустой список зависимостей);
+     * Бинарный путь (`lpBinaryPathName`): канонический путь V1 (абсолютный путь к `palka-service.exe`, корректно экранирован двойными кавычками при наличии пробелов, без командных оболочек `cmd.exe`, `powershell.exe` и произвольных аргументов).
+   * **Валидация расширенной конфигурации (`QueryServiceConfig2W`)**:
+     * Описание службы (`SERVICE_CONFIG_DESCRIPTION`): строго `PALKA parental control enforcement service`;
+     * Отложенный автозапуск (`SERVICE_CONFIG_DELAYED_AUTO_START_INFO`): отложенный запуск отключен (`fDelayedAutostart = FALSE`);
+     * Действия восстановления (`SERVICE_CONFIG_FAILURE_ACTIONS` / `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`): как специфицировано в сценарии 4.
 2. **Верификация учетной записи LocalSystem** (`SCM-01`):
    * Проверка поля учетной записи службы: строго встроенная `LocalSystem` (`NT AUTHORITY\SYSTEM`) без сохраненных паролей сервисной учетной записи.
 3. **Верификация параметров автозапуска и зависимостей** (`SCM-02`):
