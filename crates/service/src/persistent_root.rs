@@ -8,13 +8,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Name of the PALKA persistent root directory under `ProgramData`.
-pub const PALKA_DATA_DIR_NAME: &str = "Palka";
+const PALKA_DATA_DIR_NAME: &str = "Palka";
 /// Name of the canonical configuration file.
-pub const CONFIG_FILE_NAME: &str = "config.json";
+const CONFIG_FILE_NAME: &str = "config.json";
 /// Name of the canonical credentials file.
-pub const CREDENTIALS_FILE_NAME: &str = "credentials.json";
+const CREDENTIALS_FILE_NAME: &str = "credentials.json";
 /// Name of the canonical state file.
-pub const STATE_FILE_NAME: &str = "state.json";
+const STATE_FILE_NAME: &str = "state.json";
 
 /// Errors occurring during persistent root bootstrap or path resolution.
 #[derive(Debug)]
@@ -42,7 +42,10 @@ impl fmt::Display for PersistentRootError {
                 write!(f, "Platform directory protection error: {err}")
             }
             Self::UnsupportedPlatform => {
-                write!(f, "Persistent root bootstrap is unsupported on this platform")
+                write!(
+                    f,
+                    "Persistent root bootstrap is unsupported on this platform"
+                )
             }
         }
     }
@@ -74,9 +77,7 @@ pub struct PersistentPaths {
 
 impl PersistentPaths {
     /// Constructs a `PersistentPaths` object from a verified `ProgramData` base path.
-    pub(crate) fn from_program_data_base(
-        program_data_base: &Path,
-    ) -> Result<Self, PersistentRootError> {
+    fn from_program_data_base(program_data_base: &Path) -> Result<Self, PersistentRootError> {
         if program_data_base.as_os_str().is_empty() {
             return Err(PersistentRootError::InvalidProgramDataPath(
                 "ProgramData base path cannot be empty".to_string(),
@@ -132,8 +133,8 @@ impl PersistentPaths {
 pub fn bootstrap_persistent_root() -> Result<PersistentPaths, PersistentRootError> {
     #[cfg(windows)]
     {
-        let program_data = std::env::var_os("ProgramData")
-            .ok_or(PersistentRootError::ProgramDataUnavailable)?;
+        let program_data =
+            std::env::var_os("ProgramData").ok_or(PersistentRootError::ProgramDataUnavailable)?;
 
         let base_path = PathBuf::from(program_data);
         bootstrap_at_program_data_base(&base_path)
@@ -146,7 +147,7 @@ pub fn bootstrap_persistent_root() -> Result<PersistentPaths, PersistentRootErro
 }
 
 /// Internal testable bootstrap helper that operates under a specified `ProgramData` base directory.
-pub(crate) fn bootstrap_at_program_data_base(
+fn bootstrap_at_program_data_base(
     program_data_base: &Path,
 ) -> Result<PersistentPaths, PersistentRootError> {
     let paths = PersistentPaths::from_program_data_base(program_data_base)?;
@@ -364,8 +365,8 @@ mod tests {
         let root_dir = temp_env.path().join(PALKA_DATA_DIR_NAME);
         fs::create_dir(&root_dir).expect("create existing dir");
 
-        let paths = bootstrap_at_program_data_base(temp_env.path())
-            .expect("bootstrap over existing dir");
+        let paths =
+            bootstrap_at_program_data_base(temp_env.path()).expect("bootstrap over existing dir");
         assert_eq!(paths.root(), root_dir);
         assert!(paths.root().is_dir());
     }
@@ -398,11 +399,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn bootstrap_path_satisfies_platform_security_semantics() {
-        let temp_env = TestTempDir::new("security_semantics");
+    fn bootstrap_path_supports_reentrant_platform_hardening() {
+        let temp_env = TestTempDir::new("reentrant_hardening");
         let paths = bootstrap_at_program_data_base(temp_env.path()).expect("bootstrap");
 
-        // Verify that the created root satisfies ensure_protected_directory idempotence
+        // Verify that the created root supports re-entrant calls to ensure_protected_directory
         assert!(
             palka_windows_platform::ensure_protected_directory(paths.root()).is_ok(),
             "Re-invoking protected directory primitive must succeed"

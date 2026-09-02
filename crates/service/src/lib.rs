@@ -25,10 +25,7 @@ pub use persistence::{
     TelegramOutboxEntry, TelegramPayload, decode_state_json, decode_state_json_bytes,
     encode_state_json, encode_state_json_pretty,
 };
-pub use persistent_root::{
-    CONFIG_FILE_NAME, CREDENTIALS_FILE_NAME, PALKA_DATA_DIR_NAME, PersistentPaths,
-    PersistentRootError, STATE_FILE_NAME, bootstrap_persistent_root,
-};
+pub use persistent_root::{PersistentPaths, PersistentRootError, bootstrap_persistent_root};
 pub use pin_auth::{
     ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, FAILURES_PER_LOCKOUT, FailureResult,
     LOCKOUT_SCHEDULE_SECONDS, LockoutCheckResult, PinAuthError, PinLockoutState, hash_pin,
