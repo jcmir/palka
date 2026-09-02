@@ -2,6 +2,8 @@
 
 pub mod config_persistence;
 pub mod config_store;
+pub mod credentials_persistence;
+pub mod credentials_store;
 pub mod persistence;
 pub mod state_store;
 
@@ -10,6 +12,12 @@ pub use config_persistence::{
     decode_config_json_bytes, encode_config_json, encode_config_json_pretty,
 };
 pub use config_store::{ConfigFileStore, ConfigStoreError};
+pub use credentials_persistence::{
+    CREDENTIALS_SCHEMA_VERSION_V1, CredentialsPersistenceError, PersistentCredentials,
+    decode_credentials_json, decode_credentials_json_bytes, encode_credentials_json,
+    encode_credentials_json_pretty,
+};
+pub use credentials_store::{CredentialsFileStore, CredentialsStoreError};
 pub use persistence::{
     InternetRetry, OutboxEntryId, PersistenceError, PersistentState, STATE_SCHEMA_VERSION_V1,
     TelegramOutboxEntry, TelegramPayload, decode_state_json, decode_state_json_bytes,
