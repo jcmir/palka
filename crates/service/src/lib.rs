@@ -5,6 +5,7 @@ pub mod config_store;
 pub mod credentials_persistence;
 pub mod credentials_store;
 pub mod persistence;
+pub mod persistent_root;
 pub mod pin_auth;
 pub mod state_store;
 
@@ -23,6 +24,10 @@ pub use persistence::{
     InternetRetry, OutboxEntryId, PersistenceError, PersistentState, STATE_SCHEMA_VERSION_V1,
     TelegramOutboxEntry, TelegramPayload, decode_state_json, decode_state_json_bytes,
     encode_state_json, encode_state_json_pretty,
+};
+pub use persistent_root::{
+    CONFIG_FILE_NAME, CREDENTIALS_FILE_NAME, PALKA_DATA_DIR_NAME, PersistentPaths,
+    PersistentRootError, STATE_FILE_NAME, bootstrap_persistent_root,
 };
 pub use pin_auth::{
     ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, FAILURES_PER_LOCKOUT, FailureResult,
