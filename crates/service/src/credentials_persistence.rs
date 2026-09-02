@@ -566,9 +566,9 @@ mod tests {
             "$argon2id$",
             "$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // wrong algorithm (argon2i)
             "$argon2d$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // wrong algorithm (argon2d)
-            "$argon2id$v=19$m=65536",                       // missing salt and hash
-            "$argon2id$v=19$m=65536$$aGFzaA",               // empty salt component
-            "$argon2id$v=19$m=65536$c2FsdA$",               // empty hash component
+            "$argon2id$v=19$m=65536",                      // missing salt and hash
+            "$argon2id$v=19$m=65536$$aGFzaA",              // empty salt component
+            "$argon2id$v=19$m=65536$c2FsdA$",              // empty hash component
             "argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // missing leading $
         ];
 
