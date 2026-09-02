@@ -28,7 +28,10 @@ impl fmt::Display for ConfigPersistenceError {
         match self {
             Self::Json(msg) => write!(f, "JSON error in configuration codec: {msg}"),
             Self::UnsupportedSchemaVersion(v) => {
-                write!(f, "Unsupported configuration schema version: {v} (expected 1)")
+                write!(
+                    f,
+                    "Unsupported configuration schema version: {v} (expected 1)"
+                )
             }
             Self::Validation(msg) => write!(f, "Configuration validation error: {msg}"),
         }

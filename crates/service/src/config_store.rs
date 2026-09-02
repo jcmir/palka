@@ -27,7 +27,11 @@ impl fmt::Display for ConfigStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingCanonical(path) => {
-                write!(f, "Canonical config file does not exist: {}", path.display())
+                write!(
+                    f,
+                    "Canonical config file does not exist: {}",
+                    path.display()
+                )
             }
             Self::InvalidPath(msg) => write!(f, "Invalid config file path: {msg}"),
             Self::Io(err) => write!(f, "I/O error in config file store: {err}"),
@@ -359,8 +363,20 @@ mod tests {
         drop(file);
 
         assert_eq!(temp_path.parent().unwrap(), parent);
-        assert!(temp_path.file_name().unwrap().to_string_lossy().starts_with(".config.json."));
-        assert!(temp_path.file_name().unwrap().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".config.json.")
+        );
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        );
 
         let _ = fs::remove_file(&temp_path);
         let _ = fs::remove_dir_all(&dir);
@@ -395,7 +411,9 @@ mod tests {
         let err = store.save(&config).unwrap_err();
         match err {
             ConfigStoreError::Publish(_) | ConfigStoreError::Io(_) => {}
-            other => panic!("expected Publish or Io error when target is directory, got: {other:?}"),
+            other => {
+                panic!("expected Publish or Io error when target is directory, got: {other:?}")
+            }
         }
 
         let _ = fs::remove_dir_all(&dir);
