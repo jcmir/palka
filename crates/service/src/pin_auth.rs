@@ -79,13 +79,9 @@ pub fn hash_pin(pin: &SensitivePinString) -> Result<String, PinAuthError> {
 ///
 /// Returns:
 /// - `Ok(true)` if the PIN matches;
-/// - `Ok(false)` if the PIN is incorrect;
+/// - `Ok(false)` if the PIN is incorrect or candidate PIN is empty (after stored PHC policy validation);
 /// - `Err(PinAuthError)` if stored PHC is malformed, policy-downgraded, or altered.
 pub fn verify_pin(pin: &SensitivePinString, stored_phc: &str) -> Result<bool, PinAuthError> {
-    if pin.as_str().is_empty() {
-        return Ok(false);
-    }
-
     let parsed_hash =
         PasswordHash::new(stored_phc).map_err(|e| PinAuthError::MalformedHash(e.to_string()))?;
 
@@ -171,7 +167,12 @@ pub fn verify_pin(pin: &SensitivePinString, stored_phc: &str) -> Result<bool, Pi
         ));
     }
 
-    // 5. Execute Argon2 verification
+    // 5. If candidate PIN is empty, return false without performing expensive Argon2 verification
+    if pin.as_str().is_empty() {
+        return Ok(false);
+    }
+
+    // 6. Execute Argon2 verification
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
         .map_err(|e| PinAuthError::Crypto(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -349,11 +350,44 @@ mod tests {
     }
 
     #[test]
-    fn empty_candidate_pin_on_verify_returns_false() {
+    fn valid_phc_empty_candidate_pin_returns_false() {
         let pin = SensitivePinString::new("real-pin".to_string());
         let phc = hash_pin(&pin).unwrap();
         let empty_candidate = SensitivePinString::new(String::new());
-        assert!(!verify_pin(&empty_candidate, &phc).unwrap());
+        assert_eq!(verify_pin(&empty_candidate, &phc).unwrap(), false);
+    }
+
+    #[test]
+    fn malformed_phc_empty_candidate_pin_returns_error() {
+        let empty_candidate = SensitivePinString::new(String::new());
+        let malformed = "not-even-a-phc";
+        let res = verify_pin(&empty_candidate, malformed);
+        assert!(
+            res.is_err(),
+            "Malformed PHC with empty candidate must return error, got: {res:?}"
+        );
+    }
+
+    #[test]
+    fn policy_invalid_phc_empty_candidate_pin_returns_policy_violation() {
+        let empty_candidate = SensitivePinString::new(String::new());
+        let valid = sample_valid_phc();
+
+        // Policy violation: wrong m
+        let bad_m = valid.replace("m=65536", "m=32768");
+        let err_m = verify_pin(&empty_candidate, &bad_m).unwrap_err();
+        assert!(
+            matches!(err_m, PinAuthError::PolicyViolation(_)),
+            "Policy invalid PHC with empty candidate must return PolicyViolation, got: {err_m:?}"
+        );
+
+        // Policy violation: wrong algorithm
+        let bad_algo = valid.replace("$argon2id$", "$argon2i$");
+        let err_algo = verify_pin(&empty_candidate, &bad_algo).unwrap_err();
+        assert!(
+            matches!(err_algo, PinAuthError::PolicyViolation(_)),
+            "Wrong algorithm with empty candidate must return PolicyViolation, got: {err_algo:?}"
+        );
     }
 
     #[test]
@@ -442,11 +476,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_salt_or_hash_rejected_by_policy() {
+    fn missing_hash_rejected_by_policy() {
         let pin = SensitivePinString::new("pin".to_string());
-
         let missing_hash = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ";
         assert!(verify_pin(&pin, missing_hash).is_err());
+    }
+
+    #[test]
+    fn missing_salt_rejected_by_policy() {
+        let pin = SensitivePinString::new("pin".to_string());
+        let missing_salt = "$argon2id$v=19$m=65536,t=3,p=4$$c29tZWhhc2g";
+        assert!(verify_pin(&pin, missing_salt).is_err());
+    }
+
+    #[test]
+    fn malformed_stored_phc_does_not_mutate_lockout_state() {
+        let mut state = PinLockoutState::new();
+        state.record_failure(10);
+        let snapshot_before = state.clone();
+
+        let pin = SensitivePinString::new("candidate-pin".to_string());
+        let res = verify_pin(&pin, "not-even-a-phc");
+        assert!(res.is_err());
+
+        assert_eq!(
+            state, snapshot_before,
+            "Configuration error from malformed PHC must not alter lockout state"
+        );
     }
 
     #[test]
