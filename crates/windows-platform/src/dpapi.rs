@@ -7,6 +7,8 @@ use std::fmt;
 pub enum DpapiError {
     /// Input data size exceeds maximum supported length.
     InputTooLarge { size: usize },
+    /// Windows DPAPI is not supported on non-Windows platforms.
+    UnsupportedPlatform,
     /// A Windows API call failed.
     WindowsApi {
         function: &'static str,
@@ -24,6 +26,9 @@ impl fmt::Display for DpapiError {
                     "Input data size ({size} bytes) exceeds maximum supported DPAPI length ({} bytes)",
                     u32::MAX
                 )
+            }
+            Self::UnsupportedPlatform => {
+                write!(f, "Windows DPAPI is not supported on this platform")
             }
             Self::WindowsApi {
                 function,
@@ -171,23 +176,13 @@ pub fn unprotect_data(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
 }
 
 #[cfg(not(windows))]
-pub fn protect_data(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-    if plaintext.len() > u32::MAX as usize {
-        return Err(DpapiError::InputTooLarge {
-            size: plaintext.len(),
-        });
-    }
-    Ok(plaintext.to_vec())
+pub fn protect_data(_plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
 }
 
 #[cfg(not(windows))]
-pub fn unprotect_data(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-    if ciphertext.len() > u32::MAX as usize {
-        return Err(DpapiError::InputTooLarge {
-            size: ciphertext.len(),
-        });
-    }
-    Ok(ciphertext.to_vec())
+pub fn unprotect_data(_ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
 }
 
 #[cfg(test)]
