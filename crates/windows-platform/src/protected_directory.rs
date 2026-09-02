@@ -12,6 +12,8 @@ pub enum ProtectedDirectoryError {
     ParentMissing(PathBuf),
     /// The target exists but is not a directory.
     TargetExistsAndNotDirectory(PathBuf),
+    /// The target exists but is a reparse point (junction/symlink).
+    TargetIsReparsePoint(PathBuf),
     /// A Windows API call failed.
     WindowsApi {
         function: &'static str,
@@ -33,6 +35,13 @@ impl fmt::Display for ProtectedDirectoryError {
                 write!(
                     f,
                     "Target exists but is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::TargetIsReparsePoint(path) => {
+                write!(
+                    f,
+                    "Target exists but is a reparse point (symlink/junction): {}",
                     path.display()
                 )
             }
@@ -88,6 +97,53 @@ impl Drop for AutoSecurityDescriptor {
     }
 }
 
+#[cfg(windows)]
+fn win32_error_code(err: &windows::core::Error) -> u32 {
+    windows::Win32::Foundation::WIN32_ERROR::from_error(err)
+        .map(|e| e.0)
+        .unwrap_or_else(|| err.code().0 as u32)
+}
+
+#[cfg(windows)]
+fn validate_existing_attributes(attrs: u32, path: &Path) -> Result<(), ProtectedDirectoryError> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+        return Err(ProtectedDirectoryError::TargetIsReparsePoint(
+            path.to_path_buf(),
+        ));
+    }
+
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
+        return Err(ProtectedDirectoryError::TargetExistsAndNotDirectory(
+            path.to_path_buf(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn classify_get_file_attributes_error(
+    last_err: windows::Win32::Foundation::WIN32_ERROR,
+    missing_handler: impl FnOnce() -> ProtectedDirectoryError,
+) -> ProtectedDirectoryError {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+
+    if last_err == ERROR_FILE_NOT_FOUND || last_err == ERROR_PATH_NOT_FOUND {
+        missing_handler()
+    } else {
+        let err = windows::core::Error::from(last_err);
+        ProtectedDirectoryError::WindowsApi {
+            function: "GetFileAttributesW",
+            code: last_err.0,
+            message: err.message(),
+        }
+    }
+}
+
 /// Ensures that the specified directory exists and has a protected DACL.
 ///
 /// Security contract:
@@ -101,7 +157,7 @@ impl Drop for AutoSecurityDescriptor {
 pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError,
     };
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -119,7 +175,14 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
         ));
     }
 
-    let mut path_wide: Vec<u16> = path_os.encode_wide().collect();
+    let wide_units: Vec<u16> = path_os.encode_wide().collect();
+    if wide_units.contains(&0u16) {
+        return Err(ProtectedDirectoryError::InvalidPath(
+            "path contains embedded NUL character".to_string(),
+        ));
+    }
+
+    let mut path_wide = wide_units;
     path_wide.push(0);
     let path_pcwstr = PCWSTR(path_wide.as_ptr());
 
@@ -127,28 +190,49 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
     let attrs = unsafe { GetFileAttributesW(path_pcwstr) };
 
     if attrs != INVALID_FILE_ATTRIBUTES {
-        // Target exists
-        if (attrs & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
-            return Err(ProtectedDirectoryError::TargetExistsAndNotDirectory(
-                path.to_path_buf(),
-            ));
-        }
-
-        // Target exists and is a directory -> apply protected DACL
+        validate_existing_attributes(attrs, path)?;
         apply_protected_dacl_to_existing_directory(path_pcwstr)?;
         return Ok(());
     }
 
-    // Target does not exist. Verify parent directory exists.
+    // Target returned INVALID_FILE_ATTRIBUTES. Check GetLastError().
+    let last_err = unsafe { GetLastError() };
+    if last_err != ERROR_FILE_NOT_FOUND && last_err != ERROR_PATH_NOT_FOUND {
+        let err = windows::core::Error::from(last_err);
+        return Err(ProtectedDirectoryError::WindowsApi {
+            function: "GetFileAttributesW",
+            code: last_err.0,
+            message: err.message(),
+        });
+    }
+
+    // Target does not exist. Verify parent directory exists and is a directory.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            let mut parent_wide: Vec<u16> = parent.as_os_str().encode_wide().collect();
+            let parent_os = parent.as_os_str();
+            let parent_wide_units: Vec<u16> = parent_os.encode_wide().collect();
+            if parent_wide_units.contains(&0u16) {
+                return Err(ProtectedDirectoryError::InvalidPath(
+                    "parent path contains embedded NUL character".to_string(),
+                ));
+            }
+            let mut parent_wide = parent_wide_units;
             parent_wide.push(0);
-            let parent_attrs = unsafe { GetFileAttributesW(PCWSTR(parent_wide.as_ptr())) };
-            if parent_attrs == INVALID_FILE_ATTRIBUTES
-                || (parent_attrs & FILE_ATTRIBUTE_DIRECTORY.0) == 0
-            {
-                return Err(ProtectedDirectoryError::ParentMissing(parent.to_path_buf()));
+            let parent_pcwstr = PCWSTR(parent_wide.as_ptr());
+
+            let parent_attrs = unsafe { GetFileAttributesW(parent_pcwstr) };
+            if parent_attrs == INVALID_FILE_ATTRIBUTES {
+                let parent_last_err = unsafe { GetLastError() };
+                return Err(classify_get_file_attributes_error(parent_last_err, || {
+                    ProtectedDirectoryError::ParentMissing(parent.to_path_buf())
+                }));
+            }
+
+            if (parent_attrs & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
+                return Err(ProtectedDirectoryError::InvalidPath(format!(
+                    "Parent path exists but is not a directory: {}",
+                    parent.display()
+                )));
             }
         }
     }
@@ -170,7 +254,7 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
     if let Err(err) = res {
         return Err(ProtectedDirectoryError::WindowsApi {
             function: "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            code: err.code().0 as u32,
+            code: win32_error_code(&err),
             message: err.message(),
         });
     }
@@ -186,22 +270,26 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
     let created = unsafe { CreateDirectoryW(path_pcwstr, Some(&sec_attr)) };
 
     if let Err(err) = created {
-        let code = err.code().0 as u32;
-        if code == ERROR_ALREADY_EXISTS.0 {
+        let win32_code = win32_error_code(&err);
+        if win32_code == ERROR_ALREADY_EXISTS.0 {
             // Race condition: target was created concurrently.
             let cur_attrs = unsafe { GetFileAttributesW(path_pcwstr) };
-            if cur_attrs != INVALID_FILE_ATTRIBUTES && (cur_attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0
-            {
+            if cur_attrs != INVALID_FILE_ATTRIBUTES {
+                validate_existing_attributes(cur_attrs, path)?;
                 apply_protected_dacl_to_existing_directory(path_pcwstr)?;
                 return Ok(());
             } else {
-                return Err(ProtectedDirectoryError::TargetExistsAndNotDirectory(
-                    path.to_path_buf(),
-                ));
+                let cur_last_err = unsafe { GetLastError() };
+                let cur_err = windows::core::Error::from(cur_last_err);
+                return Err(ProtectedDirectoryError::WindowsApi {
+                    function: "GetFileAttributesW",
+                    code: cur_last_err.0,
+                    message: cur_err.message(),
+                });
             }
         }
 
-        if code == ERROR_PATH_NOT_FOUND.0 || code == ERROR_FILE_NOT_FOUND.0 {
+        if win32_code == ERROR_PATH_NOT_FOUND.0 || win32_code == ERROR_FILE_NOT_FOUND.0 {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     return Err(ProtectedDirectoryError::ParentMissing(parent.to_path_buf()));
@@ -211,7 +299,7 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
 
         return Err(ProtectedDirectoryError::WindowsApi {
             function: "CreateDirectoryW",
-            code,
+            code: win32_code,
             message: err.message(),
         });
     }
@@ -250,7 +338,7 @@ fn apply_protected_dacl_to_existing_directory(
     if let Err(err) = res {
         return Err(ProtectedDirectoryError::WindowsApi {
             function: "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            code: err.code().0 as u32,
+            code: win32_error_code(&err),
             message: err.message(),
         });
     }
@@ -268,7 +356,7 @@ fn apply_protected_dacl_to_existing_directory(
     if let Err(err) = get_dacl_res {
         return Err(ProtectedDirectoryError::WindowsApi {
             function: "GetSecurityDescriptorDacl",
-            code: err.code().0 as u32,
+            code: win32_error_code(&err),
             message: err.message(),
         });
     }
@@ -308,6 +396,16 @@ pub fn ensure_protected_directory(path: &Path) -> Result<(), ProtectedDirectoryE
         return Err(ProtectedDirectoryError::InvalidPath(
             "path is empty".to_string(),
         ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if path.as_os_str().as_bytes().contains(&0) {
+            return Err(ProtectedDirectoryError::InvalidPath(
+                "path contains embedded NUL character".to_string(),
+            ));
+        }
     }
 
     if let Some(parent) = path.parent() {
@@ -364,8 +462,12 @@ mod tests {
         fn new(name_prefix: &str) -> Self {
             let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
             let pid = std::process::id();
-            let path =
-                std::env::temp_dir().join(format!("palka_pdacl_{name_prefix}_{pid}_{count}"));
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir()
+                .join(format!("palka_pdacl_{name_prefix}_{pid}_{nanos}_{count}"));
             let _ = fs::remove_dir_all(&path);
             let _ = fs::remove_file(&path);
             Self { path }
@@ -378,6 +480,9 @@ mod tests {
 
     impl Drop for TempTestDir {
         fn drop(&mut self) {
+            if self.path.exists() {
+                grant_non_inheritable_owner_access(&self.path);
+            }
             let _ = fs::remove_dir_all(&self.path);
             let _ = fs::remove_file(&self.path);
         }
@@ -963,6 +1068,104 @@ mod tests {
                 assert!(!ace.sid.eq_ignore_ascii_case(SID_BUILTIN_USERS));
                 assert!(!ace.sid.eq_ignore_ascii_case(SID_AUTHENTICATED_USERS));
             }
+        }
+    }
+
+    #[test]
+    fn test_raw_win32_error_mapping() {
+        use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        let win32_err = ERROR_ALREADY_EXISTS;
+        let core_err = windows::core::Error::from(win32_err);
+        let extracted_code = win32_error_code(&core_err);
+        assert_eq!(
+            extracted_code, 183,
+            "Expected raw Win32 error code 183 (ERROR_ALREADY_EXISTS), got {extracted_code}"
+        );
+        assert_ne!(
+            extracted_code, 0x800700B7,
+            "Error code should not be HRESULT 0x800700B7"
+        );
+    }
+
+    #[test]
+    fn test_embedded_nul_path_is_rejected() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let temp = TempTestDir::new("nul_path");
+        let prefix = temp.path().join("prefix_dir");
+        assert!(!prefix.exists());
+
+        // Construct a path containing an embedded NUL: prefix_dir\0suffix
+        let mut wide = prefix.as_os_str().encode_wide().collect::<Vec<u16>>();
+        wide.push(0);
+        wide.extend("suffix".encode_utf16());
+        let invalid_path = PathBuf::from(OsString::from_wide(&wide));
+
+        let res = ensure_protected_directory(&invalid_path);
+        match res {
+            Err(ProtectedDirectoryError::InvalidPath(msg)) => {
+                assert!(msg.contains("embedded NUL"), "Unexpected message: {msg}");
+            }
+            other => panic!("Expected InvalidPath with embedded NUL, got {other:?}"),
+        }
+
+        // Verify prefix was NOT created
+        assert!(
+            !prefix.exists(),
+            "Prefix object should not have been created or modified"
+        );
+    }
+
+    #[test]
+    fn test_reparse_point_attribute_is_rejected() {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        let dummy_path = Path::new(r"C:\fake\junction_point");
+        let reparse_dir_attrs = FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0;
+
+        let res = validate_existing_attributes(reparse_dir_attrs, dummy_path);
+        match res {
+            Err(ProtectedDirectoryError::TargetIsReparsePoint(p)) => {
+                assert_eq!(p, dummy_path);
+            }
+            other => panic!("Expected TargetIsReparsePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_non_missing_attribute_error_is_not_parent_missing() {
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let dummy_parent = Path::new(r"C:\fake\parent");
+        let res = classify_get_file_attributes_error(ERROR_ACCESS_DENIED, || {
+            ProtectedDirectoryError::ParentMissing(dummy_parent.to_path_buf())
+        });
+
+        match res {
+            ProtectedDirectoryError::WindowsApi { function, code, .. } => {
+                assert_eq!(function, "GetFileAttributesW");
+                assert_eq!(code, 5, "Expected error code 5 (ERROR_ACCESS_DENIED)");
+            }
+            other => panic!("Expected WindowsApi with code 5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parent_is_file_is_rejected_as_invalid_path() {
+        let temp = TempTestDir::new("parent_is_file");
+        let parent_file = temp.path().to_path_buf();
+        fs::write(&parent_file, b"content").unwrap();
+
+        let target = parent_file.join("target_dir");
+        let res = ensure_protected_directory(&target);
+        match res {
+            Err(ProtectedDirectoryError::InvalidPath(msg)) => {
+                assert!(msg.contains("Parent path exists but is not a directory"));
+            }
+            other => panic!("Expected InvalidPath, got {other:?}"),
         }
     }
 }
