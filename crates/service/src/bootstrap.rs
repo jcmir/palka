@@ -173,8 +173,9 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("palka_bootstrap_test_{test_name}_{nanos}_{counter}"));
+            let dir = std::env::temp_dir().join(format!(
+                "palka_bootstrap_test_{test_name}_{nanos}_{counter}"
+            ));
             if dir.exists() {
                 let _ = fs::remove_dir_all(&dir);
             }
@@ -303,10 +304,9 @@ mod tests {
     // BOOT-03: Persistent root preparation failure leads to fail-closed error
     #[test]
     fn boot_03_root_failure_fails_closed() {
-        let err = bootstrap_service_with_root_fn(|| {
-            Err(PersistentRootError::ProgramDataUnavailable)
-        })
-        .unwrap_err();
+        let err =
+            bootstrap_service_with_root_fn(|| Err(PersistentRootError::ProgramDataUnavailable))
+                .unwrap_err();
 
         match err {
             ServiceBootstrapError::PersistentRoot(PersistentRootError::ProgramDataUnavailable) => {}
@@ -323,8 +323,7 @@ mod tests {
         assert!(!harness.paths.config().exists());
 
         let paths_clone = harness.paths.clone();
-        let err =
-            bootstrap_service_with_root_fn(|| Ok(paths_clone)).expect_err("must fail closed");
+        let err = bootstrap_service_with_root_fn(|| Ok(paths_clone)).expect_err("must fail closed");
 
         match err {
             ServiceBootstrapError::Config(ConfigStoreError::MissingCanonical(p)) => {
@@ -344,8 +343,7 @@ mod tests {
         harness.write_valid_state();
 
         let paths_clone = harness.paths.clone();
-        let err =
-            bootstrap_service_with_root_fn(|| Ok(paths_clone)).expect_err("must fail closed");
+        let err = bootstrap_service_with_root_fn(|| Ok(paths_clone)).expect_err("must fail closed");
 
         match err {
             ServiceBootstrapError::Config(ConfigStoreError::Codec(_)) => {}
@@ -389,7 +387,8 @@ mod tests {
                 "pin_hash": "not-an-argon2id-phc-string",
                 "telegram_bot_token_dpapi": "c3ludGhldGljLXRva2Vu"
             }"#;
-            fs::write(harness.paths.credentials(), malformed_creds_json).expect("write credentials");
+            fs::write(harness.paths.credentials(), malformed_creds_json)
+                .expect("write credentials");
 
             let paths_clone = harness.paths.clone();
             let err =
@@ -505,26 +504,19 @@ mod tests {
         let paths_clone = harness.paths.clone();
         let _ = bootstrap_service_with_root_fn(|| Ok(paths_clone));
 
-        assert_eq!(
-            fs::read(harness.paths.config()).unwrap(),
-            malformed_config
-        );
+        assert_eq!(fs::read(harness.paths.config()).unwrap(), malformed_config);
         assert_eq!(
             fs::read(harness.paths.credentials()).unwrap(),
             malformed_creds
         );
-        assert_eq!(
-            fs::read(harness.paths.state()).unwrap(),
-            malformed_state
-        );
+        assert_eq!(fs::read(harness.paths.state()).unwrap(), malformed_state);
     }
 
     // BOOT-10: Error diagnostics do not expose secrets, tokens, or PIN hashes
     #[test]
     fn boot_10_error_formatting_does_not_leak_secrets() {
-        let err_root = ServiceBootstrapError::PersistentRoot(
-            PersistentRootError::ProgramDataUnavailable,
-        );
+        let err_root =
+            ServiceBootstrapError::PersistentRoot(PersistentRootError::ProgramDataUnavailable);
         let err_cfg = ServiceBootstrapError::Config(ConfigStoreError::MissingCanonical(
             PathBuf::from("C:\\ProgramData\\Palka\\config.json"),
         ));
