@@ -1465,15 +1465,13 @@ mod tests {
     fn test_34_non_windows_dispatcher_returns_unsupported_platform() {
         #[cfg(not(windows))]
         {
-            let mut called = false;
             let res = run_palka_service_dispatcher(|_| {
-                called = true;
+                panic!("non-Windows dispatcher must not invoke service callback");
             });
             match res {
                 Err(ScmRuntimeError::UnsupportedPlatform) => (),
                 other => panic!("expected UnsupportedPlatform, got {other:?}"),
             }
-            assert!(!called);
         }
     }
 
