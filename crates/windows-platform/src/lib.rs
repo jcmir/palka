@@ -4,6 +4,7 @@ pub mod atomic_file;
 pub mod dpapi;
 pub mod protected_directory;
 pub mod scm;
+pub mod scm_provisioning;
 
 pub use atomic_file::{AtomicPublishError, atomic_publish_file};
 pub use dpapi::{DpapiError, protect_data, unprotect_data};
@@ -17,4 +18,10 @@ pub use scm::{
     PALKA_SERVICE_RESTART_DELAY_3_MS, PALKA_SERVICE_START_TYPE, PALKA_SERVICE_TYPE,
     ScmConfigMismatch, ScmConfigSnapshot, ScmQueryError, ScmRecoveryAction, ScmRecoveryActionType,
     query_palka_service_config,
+};
+
+pub use scm_provisioning::{
+    ScmProvisionError, ScmProvisionOutcome, ScmProvisionPlan, ScmProvisionResult,
+    classify_scm_mutation_error, plan_provisioning, provision_palka_service,
+    validate_and_render_canonical_binary_path,
 };
