@@ -165,43 +165,83 @@ impl fmt::Display for ScmConfigMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ServiceName { expected, actual } => {
-                write!(f, "ServiceName mismatch: expected '{expected}', got '{actual}'")
+                write!(
+                    f,
+                    "ServiceName mismatch: expected '{expected}', got '{actual}'"
+                )
             }
             Self::DisplayName { expected, actual } => {
-                write!(f, "DisplayName mismatch: expected '{expected}', got '{actual}'")
+                write!(
+                    f,
+                    "DisplayName mismatch: expected '{expected}', got '{actual}'"
+                )
             }
             Self::Description { expected, actual } => {
-                write!(f, "Description mismatch: expected '{expected}', got '{actual}'")
+                write!(
+                    f,
+                    "Description mismatch: expected '{expected}', got '{actual}'"
+                )
             }
             Self::ServiceType { expected, actual } => {
-                write!(f, "ServiceType mismatch: expected {expected:#x}, got {actual:#x}")
+                write!(
+                    f,
+                    "ServiceType mismatch: expected {expected:#x}, got {actual:#x}"
+                )
             }
             Self::Account { expected, actual } => {
                 write!(f, "Account mismatch: expected '{expected}', got '{actual}'")
             }
             Self::StartType { expected, actual } => {
-                write!(f, "StartType mismatch: expected {expected:#x}, got {actual:#x}")
+                write!(
+                    f,
+                    "StartType mismatch: expected {expected:#x}, got {actual:#x}"
+                )
             }
             Self::DelayedAutoStart { expected, actual } => {
-                write!(f, "DelayedAutoStart mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "DelayedAutoStart mismatch: expected {expected}, got {actual}"
+                )
             }
             Self::ErrorControl { expected, actual } => {
-                write!(f, "ErrorControl mismatch: expected {expected:#x}, got {actual:#x}")
+                write!(
+                    f,
+                    "ErrorControl mismatch: expected {expected:#x}, got {actual:#x}"
+                )
             }
             Self::Dependencies { expected, actual } => {
-                write!(f, "Dependencies mismatch: expected {expected:?}, got {actual:?}")
+                write!(
+                    f,
+                    "Dependencies mismatch: expected {expected:?}, got {actual:?}"
+                )
             }
             Self::BinaryPath { expected, actual } => {
-                write!(f, "BinaryPath mismatch: expected '{expected}', got '{actual}'")
+                write!(
+                    f,
+                    "BinaryPath mismatch: expected '{expected}', got '{actual}'"
+                )
             }
             Self::FailureResetPeriod { expected, actual } => {
-                write!(f, "FailureResetPeriod mismatch: expected {expected}s, got {actual}s")
+                write!(
+                    f,
+                    "FailureResetPeriod mismatch: expected {expected}s, got {actual}s"
+                )
             }
             Self::RecoveryActionsCount { expected, actual } => {
-                write!(f, "RecoveryActionsCount mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "RecoveryActionsCount mismatch: expected {expected}, got {actual}"
+                )
             }
-            Self::RecoveryActionMismatch { index, expected, actual } => {
-                write!(f, "RecoveryAction[{index}] mismatch: expected {expected}, got {actual}")
+            Self::RecoveryActionMismatch {
+                index,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "RecoveryAction[{index}] mismatch: expected {expected}, got {actual}"
+                )
             }
             Self::ProhibitedRecoveryAction { index, action } => {
                 write!(f, "ProhibitedRecoveryAction at index {index}: {action}")
@@ -335,8 +375,10 @@ impl ScmConfigSnapshot {
         }
 
         // Compare all overlapping action positions regardless of length
-        for (i, (expected, actual)) in
-            expected_actions.iter().zip(self.recovery_actions.iter()).enumerate()
+        for (i, (expected, actual)) in expected_actions
+            .iter()
+            .zip(self.recovery_actions.iter())
+            .enumerate()
         {
             if expected != actual {
                 mismatches.push(ScmConfigMismatch::RecoveryActionMismatch {
@@ -394,11 +436,21 @@ impl fmt::Display for ScmQueryError {
             Self::ServiceNotInstalled { service_name } => {
                 write!(f, "service '{service_name}' is not installed")
             }
-            Self::WindowsApi { function, code, message } => {
-                write!(f, "Windows API '{function}' failed with code {code} ({code:#x}): {message}")
+            Self::WindowsApi {
+                function,
+                code,
+                message,
+            } => {
+                write!(
+                    f,
+                    "Windows API '{function}' failed with code {code} ({code:#x}): {message}"
+                )
             }
             Self::MalformedResponse { function, detail } => {
-                write!(f, "malformed response from Windows API '{function}': {detail}")
+                write!(
+                    f,
+                    "malformed response from Windows API '{function}': {detail}"
+                )
             }
         }
     }
@@ -434,10 +486,7 @@ struct AlignedBuffer {
 #[cfg(windows)]
 impl AlignedBuffer {
     fn new(byte_len: usize) -> Self {
-        let u64_count = byte_len
-            .checked_add(7)
-            .map(|v| v / 8)
-            .unwrap_or(byte_len);
+        let u64_count = byte_len.checked_add(7).map(|v| v / 8).unwrap_or(byte_len);
         Self {
             data: vec![0u64; u64_count],
             byte_len,
@@ -447,17 +496,13 @@ impl AlignedBuffer {
     fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: `self.data` holds `data.len() * 8` bytes which is >= `self.byte_len`.
         // The slice is fully valid for mutable byte-level access up to `self.byte_len`.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut u8, self.byte_len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut u8, self.byte_len) }
     }
 
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: `self.data` holds `data.len() * 8` bytes which is >= `self.byte_len`.
         // The slice is fully valid for read-only access up to `self.byte_len`.
-        unsafe {
-            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.byte_len)
-        }
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.byte_len) }
     }
 
     fn as_struct<T>(&self) -> Result<&T, ScmQueryError> {
@@ -514,12 +559,13 @@ fn decode_utf16_z_within_buffer(
 
     let p_addr = ptr.0 as usize;
     let b_start = buffer.as_ptr() as usize;
-    let b_end = b_start.checked_add(buffer.len()).ok_or_else(|| {
-        ScmQueryError::MalformedResponse {
-            function: field_name,
-            detail: "buffer address arithmetic overflow".to_string(),
-        }
-    })?;
+    let b_end =
+        b_start
+            .checked_add(buffer.len())
+            .ok_or_else(|| ScmQueryError::MalformedResponse {
+                function: field_name,
+                detail: "buffer address arithmetic overflow".to_string(),
+            })?;
 
     if p_addr < b_start || p_addr >= b_end || (p_addr % 2) != 0 {
         return Err(ScmQueryError::MalformedResponse {
@@ -563,12 +609,13 @@ fn parse_multi_sz_within_buffer(
     }
     let p_addr = ptr.0 as usize;
     let b_start = buffer.as_ptr() as usize;
-    let b_end = b_start.checked_add(buffer.len()).ok_or_else(|| {
-        ScmQueryError::MalformedResponse {
-            function: "QueryServiceConfigW(lpDependencies)",
-            detail: "buffer address arithmetic overflow".to_string(),
-        }
-    })?;
+    let b_end =
+        b_start
+            .checked_add(buffer.len())
+            .ok_or_else(|| ScmQueryError::MalformedResponse {
+                function: "QueryServiceConfigW(lpDependencies)",
+                detail: "buffer address arithmetic overflow".to_string(),
+            })?;
 
     if p_addr < b_start || p_addr >= b_end || (p_addr % 2) != 0 {
         return Err(ScmQueryError::MalformedResponse {
@@ -593,12 +640,11 @@ fn parse_multi_sz_within_buffer(
                 // Double null terminator indicates end of MULTI_SZ list
                 return Ok(result);
             } else {
-                let s = String::from_utf16(&current).map_err(|e| {
-                    ScmQueryError::MalformedResponse {
+                let s =
+                    String::from_utf16(&current).map_err(|e| ScmQueryError::MalformedResponse {
                         function: "QueryServiceConfigW(lpDependencies)",
                         detail: format!("invalid UTF-16 in dependencies: {e}"),
-                    }
-                })?;
+                    })?;
                 result.push(s);
                 current.clear();
             }
@@ -639,24 +685,18 @@ pub fn query_palka_service_config() -> Result<ScmConfigSnapshot, ScmQueryError> 
 
 #[cfg(windows)]
 fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryError> {
-    use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_DOES_NOT_EXIST};
     use windows::Win32::System::Services::*;
+    use windows::core::{PCWSTR, PWSTR};
 
     // 1. Open local SCM manager with minimal SC_MANAGER_CONNECT access
     // SAFETY: Local SCM connection with null machine/database names. Desired access is SC_MANAGER_CONNECT only.
-    let scm_raw = unsafe {
-        OpenSCManagerW(
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SC_MANAGER_CONNECT,
-        )
-    }
-    .map_err(|e| ScmQueryError::WindowsApi {
-        function: "OpenSCManagerW",
-        code: win32_error_code(&e),
-        message: e.message().to_string(),
-    })?;
+    let scm_raw = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        .map_err(|e| ScmQueryError::WindowsApi {
+            function: "OpenSCManagerW",
+            code: win32_error_code(&e),
+            message: e.message().to_string(),
+        })?;
     let scm = ScHandle(scm_raw);
 
     // 2. Open service directly by canonical service key name ("PalkaService")
@@ -694,9 +734,7 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
     // 3. Query basic configuration (QueryServiceConfigW)
     let mut config_bytes_needed = 0u32;
     // SAFETY: Initial sizing call with None buffer to retrieve required buffer size in bytes.
-    let config_size_res = unsafe {
-        QueryServiceConfigW(svc.0, None, 0, &mut config_bytes_needed)
-    };
+    let config_size_res = unsafe { QueryServiceConfigW(svc.0, None, 0, &mut config_bytes_needed) };
     if let Err(ref e) = config_size_res {
         if e.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
             && win32_error_code(e) != ERROR_INSUFFICIENT_BUFFER.0
@@ -752,10 +790,7 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
         false,
     )?;
 
-    let dependencies = parse_multi_sz_within_buffer(
-        qsc.lpDependencies,
-        config_buf.as_bytes(),
-    )?;
+    let dependencies = parse_multi_sz_within_buffer(qsc.lpDependencies, config_buf.as_bytes())?;
 
     // 4. Exact case-preserved service key name proof via GetServiceKeyNameW
     // using ACTUAL display name returned by SCM
@@ -787,12 +822,13 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
         }
     }
 
-    let buf_len = (cch_needed as usize).checked_add(1).ok_or_else(|| {
-        ScmQueryError::MalformedResponse {
-            function: "GetServiceKeyNameW",
-            detail: "buffer size arithmetic overflow".to_string(),
-        }
-    })?;
+    let buf_len =
+        (cch_needed as usize)
+            .checked_add(1)
+            .ok_or_else(|| ScmQueryError::MalformedResponse {
+                function: "GetServiceKeyNameW",
+                detail: "buffer size arithmetic overflow".to_string(),
+            })?;
     let mut key_name_buf = vec![0u16; buf_len];
     let mut cch_actual = key_name_buf.len() as u32;
 
@@ -818,12 +854,10 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
         });
     }
 
-    let actual_service_key_name =
-        String::from_utf16(&key_name_buf[..cch_actual as usize]).map_err(|e| {
-            ScmQueryError::MalformedResponse {
-                function: "GetServiceKeyNameW",
-                detail: format!("invalid UTF-16 in service key name: {e}"),
-            }
+    let actual_service_key_name = String::from_utf16(&key_name_buf[..cch_actual as usize])
+        .map_err(|e| ScmQueryError::MalformedResponse {
+            function: "GetServiceKeyNameW",
+            detail: format!("invalid UTF-16 in service key name: {e}"),
         })?;
 
     // 5. Query description (QueryServiceConfig2W / SERVICE_CONFIG_DESCRIPTION)
@@ -892,8 +926,9 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
             let s = delayed_buf.as_struct::<SERVICE_DELAYED_AUTO_START_INFO>()?;
             s.fDelayedAutostart.as_bool()
         }
-        Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult()
-            || win32_error_code(&e) == ERROR_INSUFFICIENT_BUFFER.0 =>
+        Err(e)
+            if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult()
+                || win32_error_code(&e) == ERROR_INSUFFICIENT_BUFFER.0 =>
         {
             let mut dynamic_buf = AlignedBuffer::new(delayed_bytes_needed as usize);
             // SAFETY: Re-querying with dynamically sized buffer.
@@ -975,21 +1010,21 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
 
         let action_count = fail_struct.cActions as usize;
         let action_size = std::mem::size_of::<SC_ACTION>();
-        let total_action_bytes = action_count
-            .checked_mul(action_size)
-            .ok_or_else(|| ScmQueryError::MalformedResponse {
+        let total_action_bytes = action_count.checked_mul(action_size).ok_or_else(|| {
+            ScmQueryError::MalformedResponse {
                 function: "QueryServiceConfig2W(FAILURE_ACTIONS)",
                 detail: "action array size arithmetic overflow".to_string(),
-            })?;
+            }
+        })?;
 
         let actions_ptr = fail_struct.lpsaActions as usize;
         let buf_start = fail_buf.as_bytes().as_ptr() as usize;
-        let buf_end = buf_start.checked_add(fail_buf.as_bytes().len()).ok_or_else(|| {
-            ScmQueryError::MalformedResponse {
+        let buf_end = buf_start
+            .checked_add(fail_buf.as_bytes().len())
+            .ok_or_else(|| ScmQueryError::MalformedResponse {
                 function: "QueryServiceConfig2W(FAILURE_ACTIONS)",
                 detail: "buffer address arithmetic overflow".to_string(),
-            }
-        })?;
+            })?;
 
         let actions_end = actions_ptr.checked_add(total_action_bytes).ok_or_else(|| {
             ScmQueryError::MalformedResponse {
@@ -1010,9 +1045,8 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
 
         // SAFETY: `actions_ptr` resides completely within `fail_buf` bounds,
         // has length `action_count` elements, and is aligned to align_of::<SC_ACTION>().
-        let actions_slice = unsafe {
-            std::slice::from_raw_parts(fail_struct.lpsaActions, action_count)
-        };
+        let actions_slice =
+            unsafe { std::slice::from_raw_parts(fail_struct.lpsaActions, action_count) };
 
         for action in actions_slice {
             let action_type = match action.Type {
@@ -1048,8 +1082,9 @@ fn query_palka_service_config_windows() -> Result<ScmConfigSnapshot, ScmQueryErr
             let s = flag_buf.as_struct::<SERVICE_FAILURE_ACTIONS_FLAG>()?;
             s.fFailureActionsOnNonCrashFailures.as_bool()
         }
-        Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult()
-            || win32_error_code(&e) == ERROR_INSUFFICIENT_BUFFER.0 =>
+        Err(e)
+            if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult()
+                || win32_error_code(&e) == ERROR_INSUFFICIENT_BUFFER.0 =>
         {
             let mut dynamic_buf = AlignedBuffer::new(flag_bytes_needed as usize);
             // SAFETY: Re-querying with dynamically sized buffer.
