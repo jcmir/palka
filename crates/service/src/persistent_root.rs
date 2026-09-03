@@ -156,6 +156,13 @@ fn bootstrap_at_program_data_base(
 }
 
 #[cfg(test)]
+pub(crate) fn canonical_paths_for_test(
+    program_data_base: &Path,
+) -> Result<PersistentPaths, PersistentRootError> {
+    PersistentPaths::from_program_data_base(program_data_base)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;

@@ -1,5 +1,6 @@
 //! Service daemon library for PALKA.
 
+pub mod bootstrap;
 pub mod config_persistence;
 pub mod config_store;
 pub mod credentials_persistence;
@@ -8,6 +9,8 @@ pub mod persistence;
 pub mod persistent_root;
 pub mod pin_auth;
 pub mod state_store;
+
+pub use bootstrap::{BootstrappedServiceState, ServiceBootstrapError, bootstrap_service};
 
 pub use config_persistence::{
     CONFIG_SCHEMA_VERSION_V1, ConfigPersistenceError, PersistentConfig, decode_config_json,
