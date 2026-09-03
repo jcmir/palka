@@ -5,6 +5,7 @@ pub mod dpapi;
 pub mod protected_directory;
 pub mod scm;
 pub mod scm_provisioning;
+pub mod scm_runtime;
 
 pub use atomic_file::{AtomicPublishError, atomic_publish_file};
 pub use dpapi::{DpapiError, protect_data, unprotect_data};
@@ -24,4 +25,10 @@ pub use scm_provisioning::{
     ScmProvisionError, ScmProvisionOutcome, ScmProvisionPlan, ScmProvisionResult,
     classify_scm_mutation_error, plan_provisioning, provision_palka_service,
     validate_and_render_canonical_binary_path,
+};
+
+pub use scm_runtime::{
+    CanonicalServiceStatus, DecodedControl, PalkaServiceEntry, ScmLifecycleStateMachine,
+    ScmRuntimeControl, ScmRuntimeError, ScmServiceContext, ScmServiceState, decode_service_control,
+    handle_control_request, run_palka_service_dispatcher,
 };
