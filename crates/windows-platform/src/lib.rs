@@ -3,9 +3,18 @@
 pub mod atomic_file;
 pub mod dpapi;
 pub mod protected_directory;
+pub mod scm;
 
 pub use atomic_file::{AtomicPublishError, atomic_publish_file};
 pub use dpapi::{DpapiError, protect_data, unprotect_data};
 pub use protected_directory::{
     PROTECTED_DIRECTORY_SDDL, ProtectedDirectoryError, ensure_protected_directory,
+};
+pub use scm::{
+    PALKA_SERVICE_ACCOUNT, PALKA_SERVICE_DESCRIPTION, PALKA_SERVICE_DISPLAY_NAME,
+    PALKA_SERVICE_ERROR_CONTROL, PALKA_SERVICE_NAME, PALKA_SERVICE_RESET_PERIOD_SEC,
+    PALKA_SERVICE_RESTART_DELAY_1_MS, PALKA_SERVICE_RESTART_DELAY_2_MS,
+    PALKA_SERVICE_RESTART_DELAY_3_MS, PALKA_SERVICE_START_TYPE, PALKA_SERVICE_TYPE,
+    ScmConfigMismatch, ScmConfigSnapshot, ScmQueryError, ScmRecoveryAction, ScmRecoveryActionType,
+    query_palka_service_config,
 };
