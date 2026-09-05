@@ -180,24 +180,31 @@ pub fn execution_failure_transition(
 
 /// Determines the overdue transition for an action recovered after startup when `current_remaining_seconds <= 0`.
 ///
-/// Only applies to `Pending` actions.
-/// `ActionKind::BlockInternet` transitions to `Executing` (enforcement/reconciliation proceeds).
-/// `ActionKind::ShutdownComputer` transitions to `Missed` (past-deadline shutdown is not executed).
-/// For non-overdue (`current_remaining_seconds > 0`) or non-`Pending` states returns `None`.
+/// For `ActionKind::BlockInternet`, only applies to `Pending` actions, which transition to `Executing`.
+/// For `ActionKind::ShutdownComputer`, applies to `Pending`, `Executing`, and `Failed` actions, which
+/// transition to `Missed` (past-deadline shutdown is never triggered on restart).
+/// For non-overdue (`current_remaining_seconds > 0`) or terminal (`Completed`, `Missed`) states returns `None`.
 pub fn recovery_overdue_transition(
     action_kind: ActionKind,
     current_state: &ActionExecutionState,
     current_remaining_seconds: i64,
 ) -> Option<ActionExecutionState> {
-    if !deadline_is_due(current_remaining_seconds)
-        || !matches!(current_state, ActionExecutionState::Pending)
-    {
+    if !deadline_is_due(current_remaining_seconds) {
         return None;
     }
 
-    match action_kind {
-        ActionKind::BlockInternet => Some(ActionExecutionState::Executing),
-        ActionKind::ShutdownComputer => Some(ActionExecutionState::Missed),
+    match (action_kind, current_state) {
+        (ActionKind::BlockInternet, ActionExecutionState::Pending) => {
+            Some(ActionExecutionState::Executing)
+        }
+        (ActionKind::BlockInternet, _) => None,
+        (ActionKind::ShutdownComputer, ActionExecutionState::Pending)
+        | (ActionKind::ShutdownComputer, ActionExecutionState::Executing)
+        | (ActionKind::ShutdownComputer, ActionExecutionState::Failed { .. }) => {
+            Some(ActionExecutionState::Missed)
+        }
+        (ActionKind::ShutdownComputer, ActionExecutionState::Completed)
+        | (ActionKind::ShutdownComputer, ActionExecutionState::Missed) => None,
     }
 }
 
@@ -846,18 +853,10 @@ mod tests {
     }
 
     #[test]
-    fn recovery_non_pending_states_do_not_apply_pending_overdue_rule() {
+    fn recovery_non_pending_states_follow_normative_overdue_policy() {
         assert_eq!(
             recovery_overdue_transition(
                 ActionKind::BlockInternet,
-                &ActionExecutionState::Executing,
-                0,
-            ),
-            None
-        );
-        assert_eq!(
-            recovery_overdue_transition(
-                ActionKind::ShutdownComputer,
                 &ActionExecutionState::Executing,
                 0,
             ),
@@ -875,10 +874,59 @@ mod tests {
         );
         assert_eq!(
             recovery_overdue_transition(
+                ActionKind::BlockInternet,
+                &ActionExecutionState::Completed,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::BlockInternet,
+                &ActionExecutionState::Missed,
+                0,
+            ),
+            None
+        );
+
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Pending,
+                0,
+            ),
+            Some(ActionExecutionState::Missed)
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Executing,
+                0,
+            ),
+            Some(ActionExecutionState::Missed)
+        );
+        assert_eq!(
+            recovery_overdue_transition(
                 ActionKind::ShutdownComputer,
                 &ActionExecutionState::Failed {
                     reason: "err".to_string()
                 },
+                0,
+            ),
+            Some(ActionExecutionState::Missed)
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Completed,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery_overdue_transition(
+                ActionKind::ShutdownComputer,
+                &ActionExecutionState::Missed,
                 0,
             ),
             None

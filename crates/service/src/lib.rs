@@ -8,6 +8,7 @@ pub mod credentials_store;
 pub mod persistence;
 pub mod persistent_root;
 pub mod pin_auth;
+pub mod runtime;
 pub mod state_store;
 
 pub use bootstrap::{BootstrappedServiceState, ServiceBootstrapError, bootstrap_service};
@@ -33,5 +34,11 @@ pub use pin_auth::{
     ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, FAILURES_PER_LOCKOUT, FailureResult,
     LOCKOUT_SCHEDULE_SECONDS, LockoutCheckResult, PinAuthError, PinLockoutState, hash_pin,
     verify_pin,
+};
+pub use runtime::{
+    IdSource, InternetGate, InternetRetryPolicy, PlatformError, PowerController, RuntimeClock,
+    RuntimeConstructionError, RuntimeHandle, SchedulerError, ServiceRuntime, ServiceRuntimeError,
+    StartupReadiness, StartupRecoveryError, SystemClock, TeardownError, WorkerError,
+    remaining_seconds_from_delta_ms,
 };
 pub use state_store::{StateFileStore, StateStoreError};
