@@ -20,8 +20,8 @@
    * Владеет жизненным циклом и состоянием службы;
    * Регистрирует точку входа службы и обработчик управляющих сигналов (Service Control Handler);
    * Управляет переходами статусов SCM (`START_PENDING`, `RUNNING`, `STOP_PENDING`, `STOPPED`);
-   * Инициирует авторитетный runtime планировщика и принудительного исполнения после перехода в `SERVICE_RUNNING`;
-   * Обеспечивает корректное (graceful) завершение runtime при получении авторизованного сигнала `SERVICE_CONTROL_STOP`.
+   * Инициирует `bootstrap_service()`, конструирует и активирует авторитетный `ServiceRuntime` до перехода в `SERVICE_RUNNING` (см. [Контракт оркестрации рантайма](./016-service-runtime-orchestration-contract.md) и [Контракт интеграции исполняемого файла](./017-service-scm-executable-integration-contract.md));
+   * Обеспечивает корректное (graceful) завершение runtime при получении авторизованного сигнала `SERVICE_CONTROL_STOP` или `SERVICE_CONTROL_SHUTDOWN`.
 
 2. **`palka-windows-platform` (`PLATFORM`)**:
    * Содержит низкоуровневые вызовы Win32 SCM API (OpenSCManagerW, CreateServiceW, ChangeServiceConfigW, ChangeServiceConfig2W, QueryServiceStatusEx, QueryServiceConfigW и др.);
@@ -172,17 +172,22 @@
 [SCM Process Launch]
         │
         ▼
- SERVICE_START_PENDING  ──(ошибка bootstrap)──►  SERVICE_STOPPED (ExitCode != 0)
+ SERVICE_START_PENDING (CP 1) ──(ошибка bootstrap)──────────────► SERVICE_STOPPED (ExitCode != 0)
         │
  (успешный bootstrap)
         │
         ▼
-   SERVICE_RUNNING
+ SERVICE_START_PENDING (CP 2) ──(ошибка runtime/recovery)────────► SERVICE_STOPPED (ExitCode != 0)
         │
- (получен авторизованный SERVICE_CONTROL_STOP)
+ (runtime готов: Ready / Degraded)
         │
         ▼
-  SERVICE_STOP_PENDING
+   SERVICE_RUNNING (Controls: STOP | SHUTDOWN)
+        │
+ (получен авторизованный SERVICE_CONTROL_STOP / SHUTDOWN)
+        │
+        ▼
+  SERVICE_STOP_PENDING (CP 1)
         │
  (graceful runtime teardown завершен)
         │
@@ -191,19 +196,19 @@
 ```
 
 1. **`SERVICE_START_PENDING`**:
-   * Устанавливается немедленно после входа в `ServiceMain`.
-   * Значение `dwWaitHint` устанавливается достаточным для инициализации (например, 10 000 мс).
-   * При длительной инициализации значение `dwCheckPoint` монотонно инкрементируется.
-   * Выполняется базовый bootstrap хранилища `%ProgramData%\Palka`, валидация канонических файлов и инициализация подсистем.
-   * При критическом сбое bootstrap служба сообщает `SERVICE_STOPPED` с ненулевым кодом завершения.
+   * Чекпоинт 1 устанавливается немедленно после входа в `ServiceMain`.
+   * Значение `dwWaitHint` устанавливается достаточным для инициализации (например, 30 000 мс).
+   * Выполняется базовый bootstrap хранилища `%ProgramData%\PALKA`, валидация канонических файлов (`config.json`, `credentials.json`, `state.json`).
+   * При успешном bootstrap публикуется чекпоинт 2 (`dwCheckPoint = 2`), после чего конструируется и активируется `ServiceRuntime`, выполняется процедура восстановления (Startup Recovery) и первичное согласование шлюза (см. [Контракт интеграции](./017-service-scm-executable-integration-contract.md)).
+   * При критическом сбое bootstrap или рантайма служба сообщает `SERVICE_STOPPED` с ненулевым кодом завершения без перехода в `SERVICE_RUNNING`.
 2. **`SERVICE_RUNNING`**:
-   * Устанавливается только после успешного завершения обязательного bootstrap.
+   * Устанавливается **строго после** успешного bootstrap, завершения recovery рантайма и подтверждения готовности (`StartupReadiness::Ready(_)` или `StartupReadiness::Degraded(_)` согласно `docs/016` и `docs/017`). Успешный bootstrap сам по себе категорически недостаточен для перехода в `SERVICE_RUNNING`.
    * Служба сообщает `dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN`.
    * Запускается авторитетный цикл планировщика и принудительного исполнения.
 3. **`SERVICE_STOP_PENDING`**:
-   * Устанавливается при получении авторизованного сигнала `SERVICE_CONTROL_STOP`.
+   * Устанавливается при получении авторизованного сигнала `SERVICE_CONTROL_STOP` или `SERVICE_CONTROL_SHUTDOWN`.
    * Запрещается прием новых IPC-запросов и задач.
-   * Передается сигнал завершения авторитетному runtime.
+   * Передается сигнал завершения авторитетному runtime (`runtime.stop()`).
    * Значение `dwCheckPoint` инкрементируется до завершения фоновых потоков и сохранения состояния на диск.
 4. **`SERVICE_STOPPED`**:
    * При штатной остановке администратором: Win32 Exit Code = `ERROR_SUCCESS` (0).
