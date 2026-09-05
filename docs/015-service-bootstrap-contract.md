@@ -290,8 +290,8 @@ sequenceDiagram
    * Инициализация подсистем таймеров, WFP, Telegram и локального IPC в соответствии с правилами обязательности.
    * Восстановление просроченных доменных решений.
 3. **`SERVICE-SCM-EXECUTABLE-INTEGRATION`**:
-   * Интеграция точки входа `crates/service/src/main.rs` с диспетчером `palka-windows-platform::scm_runtime`.
-   * Реализация последовательности: `START_PENDING` -> `bootstrap_service()` -> запуск рантайма -> `RUNNING`.
+   * Интеграция точки входа `crates/service/src/main.rs` с диспетчером `palka-windows-platform::scm_runtime` (см. [Контракт интеграции исполняемого файла](./017-service-scm-executable-integration-contract.md)).
+   * Реализация последовательности: `START_PENDING (cp 1)` -> `bootstrap_service()` -> `START_PENDING (cp 2)` -> запуск рантайма -> `RUNNING`.
    * Реализация graceful teardown при получении `STOP`/`SHUTDOWN`.
 4. **`V3 SCM INTEGRATION`**:
    * Проведение интеграционных тестов в реальной среде Windows SCM.

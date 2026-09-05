@@ -547,7 +547,7 @@ pub enum ServiceRuntimeError {
 Настоящий контракт оркестрации рантайма **ЯВНО И ОСОЗНАННО ИСКЛЮЧАЕТ** следующие компоненты и жизненные циклы:
 
 1. **`SERVICE-SCM-EXECUTABLE-INTEGRATION`**:
-   Интеграция точки входа исполняемого файла `crates/service/src/main.rs` с диспетчером `scm_runtime.rs`, системный цикл Windows Service и вызовы SCM API.
+   Интеграция точки входа исполняемого файла `crates/service/src/main.rs` с диспетчером `scm_runtime.rs`, системный цикл Windows Service и вызовы SCM API (детально специфицировано в [Контракте интеграции исполняемого файла службы](./017-service-scm-executable-integration-contract.md)).
 2. **`WINDOWS-INTERNET-GATE`**:
    Низкоуровневая реализация сетевой фильтрации на базе Windows Filtering Platform (WFP), драйверные фильтры, сублокации и разрыв соединений.
 3. **`WINDOWS-POWER-CONTROLLER`**:
