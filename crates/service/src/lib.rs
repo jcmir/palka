@@ -10,6 +10,7 @@ pub mod persistent_root;
 pub mod pin_auth;
 pub mod runtime;
 pub mod state_store;
+pub mod windows_internet_gate;
 
 pub use bootstrap::{BootstrappedServiceState, ServiceBootstrapError, bootstrap_service};
 
@@ -42,3 +43,4 @@ pub use runtime::{
     remaining_seconds_from_delta_ms,
 };
 pub use state_store::{StateFileStore, StateStoreError};
+pub use windows_internet_gate::WindowsInternetRetryPolicy;
