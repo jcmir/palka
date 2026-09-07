@@ -2,6 +2,9 @@
 
 pub mod atomic_file;
 pub mod dpapi;
+pub mod id_source;
+#[cfg(windows)]
+mod id_source_windows;
 pub mod internet_gate;
 pub mod power;
 #[cfg(windows)]
@@ -55,6 +58,7 @@ pub use scm_runtime::{
     handle_control_request, run_palka_service_dispatcher,
 };
 
+pub use id_source::{WindowsIdGeneratorError, WindowsIdSequence};
 pub use power::{
     AdjustPrivilegeResult, CANONICAL_SHUTDOWN_FORCE_APPS, CANONICAL_SHUTDOWN_MACHINE,
     CANONICAL_SHUTDOWN_MESSAGE, CANONICAL_SHUTDOWN_REASON, CANONICAL_SHUTDOWN_REBOOT,

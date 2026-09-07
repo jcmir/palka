@@ -10,6 +10,7 @@ pub mod persistent_root;
 pub mod pin_auth;
 pub mod runtime;
 pub mod state_store;
+pub mod windows_id_source;
 pub mod windows_internet_gate;
 pub mod windows_power_controller;
 
@@ -44,5 +45,6 @@ pub use runtime::{
     remaining_seconds_from_delta_ms,
 };
 pub use state_store::{StateFileStore, StateStoreError};
+pub use windows_id_source::WindowsIdSourceAdapter;
 pub use windows_internet_gate::WindowsInternetRetryPolicy;
 pub use windows_power_controller::WindowsPowerControllerAdapter;
