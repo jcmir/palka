@@ -3,6 +3,9 @@
 pub mod atomic_file;
 pub mod dpapi;
 pub mod internet_gate;
+pub mod power;
+#[cfg(windows)]
+pub mod power_windows;
 pub mod protected_directory;
 pub mod scm;
 pub mod scm_provisioning;
@@ -50,4 +53,21 @@ pub use scm_runtime::{
     CanonicalServiceStatus, DecodedControl, PalkaServiceEntry, ScmLifecycleStateMachine,
     ScmRuntimeControl, ScmRuntimeError, ScmServiceContext, ScmServiceState, decode_service_control,
     handle_control_request, run_palka_service_dispatcher,
+};
+
+pub use power::{
+    AdjustPrivilegeResult, CANONICAL_SHUTDOWN_FORCE_APPS, CANONICAL_SHUTDOWN_MACHINE,
+    CANONICAL_SHUTDOWN_MESSAGE, CANONICAL_SHUTDOWN_REASON, CANONICAL_SHUTDOWN_REBOOT,
+    CANONICAL_SHUTDOWN_TIMEOUT, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_ENOUGH_MEMORY,
+    ERROR_PRIVILEGE_NOT_HELD, ERROR_SHUTDOWN_IN_PROGRESS, FakeWindowsPowerPort, Luid,
+    LuidAndAttributes, PreviousPrivilegeState, RawTokenHandle, RestorePrivilegeResult,
+    ShutdownCallParams, SizingResult, TestPowerPort, UnsupportedPowerPort, WindowsPowerController,
+    WindowsPowerError, WindowsPowerPort, validate_restore_buffer,
+};
+
+#[cfg(windows)]
+pub use power_windows::{
+    AlignedBuffer, SafeHandle, WindowsPowerEngine, raw_win32_code_from_error,
+    raw_win32_code_from_hresult,
 };

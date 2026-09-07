@@ -18,4 +18,6 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Rpc",
     "Win32_System_Services",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
 ]
