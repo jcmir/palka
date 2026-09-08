@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/ipc-protocol",
     "crates/service",
     "crates/tray",
     "crates/windows-platform",
