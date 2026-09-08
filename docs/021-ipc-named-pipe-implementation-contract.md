@@ -142,26 +142,168 @@ BLOCKING_PIPE_IO_WITHOUT_CANCELLATION_PATH = NO
 
 ## 8. Дескриптор безопасности и авторизация клиентов (Security Descriptor & Client Authorization)
 
-### 8.1. Список контроля доступа (DACL)
+### 8.1. Список контроля доступа (DACL) и защита прав ребенка
 Канал создается с явным дескриптором безопасности (`SECURITY_DESCRIPTOR`), содержащим защищенный список контроля доступа (`DACL`):
-* `NT AUTHORITY\SYSTEM`: Полный доступ (`FILE_ALL_ACCESS`);
-* `BUILTIN\Administrators`: Полный доступ (`FILE_ALL_ACCESS`);
-* `Configured Child SID`: Чтение и запись (`GENERIC_READ | GENERIC_WRITE`);
-* `Anonymous Logon`: Безусловный запрет (`Access Denied`);
-* `Network Logon`: Безусловный запрет (`Access Denied`).
+* `NT AUTHORITY\SYSTEM`: Полный доступ (`FILE_ALL_ACCESS` / SDDL `(A;;FA;;;SY)`);
+* `BUILTIN\Administrators`: Полный доступ (`FILE_ALL_ACCESS` / SDDL `(A;;FA;;;BA)`);
+* `Configured Child SID`: Строго ограниченный доступ клиента канала в DACL ядра без права создания экземпляров (`CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK = 0x00100083`);
+* `Anonymous Logon`: Безусловный явный запрет (`Access Denied` / SDDL `(D;;GA;;;AN)`);
+* `Network Logon`: Безусловный явный запрет (`Access Denied` / SDDL `(D;;GA;;;NU)`).
 
-### 8.2. Проверка токена клиента после подключения (Post-Connect Token Inspection)
-DACL является лишь первой линией защиты (пропускным шлюзом ядра). Сам по себе DACL не идентифицирует роль клиента. После успешного `ConnectNamedPipe` служба выполняет обязательную процедуру идентификации:
-1. Вызов `ImpersonateNamedPipeClient(pipe_handle)`;
-2. Получение маркера доступа клиента через `OpenThreadToken`;
-3. Извлечение `TokenUser` (проверка соответствия сконфигурированному SID ребенка);
-4. Проверка присутствия группы локальных администраторов (`TokenGroups`);
-5. **Безусловный вызов `RevertToSelf()`** на всех путях выполнения (включая ветки ошибок) ДО парсинга и обработки данных протокола;
-6. Неожиданные локальные идентификаторы немедленно отключаются с закрытием канала (`Fail-Closed`).
+#### Устранение уязвимости создания экземпляров канала (Child Pipe Instance Creation Hazard):
+В архитектуре Windows Named Pipe битовая маска `FILE_APPEND_DATA` (0x0004) совпадает с правом создания новых экземпляров канала `FILE_CREATE_PIPE_INSTANCE` (0x0004). Стандартные составные маски `GENERIC_WRITE`, `FILE_GENERIC_WRITE`, а также SDDL-псевдонимы `GW` и `FW` включают этот бит. Предоставление таких прав непривилегированному ребенку несет критическую уязвимость перехвата канала и создания фальшивых экземпляров.
+
+Нормативные требования:
+```text
+CONFIGURED_CHILD_PIPE_INSTANCE_CREATION = DENY
+CONFIGURED_CHILD_FILE_CREATE_PIPE_INSTANCE = NOT_GRANTED
+CONFIGURED_CHILD_FILE_APPEND_DATA = NOT_GRANTED
+CHILD_GENERIC_WRITE_USAGE = FORBIDDEN
+CHILD_FILE_GENERIC_WRITE_USAGE = FORBIDDEN
+CHILD_SDDL_GW_USAGE = FORBIDDEN
+CHILD_SDDL_FW_USAGE = FORBIDDEN
+```
+
+#### Разделение масок доступа: серверный грант DACL против клиентского запроса CreateFileW:
+Контракт строго разделяет:
+1. **Права, предоставляемые сервером ребенку в дескрипторе безопасности DACL (`CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK`)**;
+2. **Права, явно запрашиваемые клиентом ребенка при вызове `CreateFileW` (`CHILD_PIPE_CLIENT_DESIRED_ACCESS_MASK`)**.
+
+Эти маски **НЕ ТОЖДЕСТВЕННЫ** (`SERVER_DACL_GRANT != CLIENT_DESIRED_ACCESS`).
+
+#### Обоснование асимметрии на основе физических свидетельств Windows Named Pipe:
+Прямая верификация на реальном стенде Win32 API ядра Windows установила:
+* Клиентский вызов `CreateFileW` со строго минимальной маской `dwDesiredAccess = 0x00000003` (`FILE_READ_DATA | FILE_WRITE_DATA`) и флагом `FILE_FLAG_OVERLAPPED` успешно открывает канал, если DACL объекта канала ядра предоставляет системные права, необходимые подсистеме ввода-вывода Windows для подключения;
+* Двунаправленный асинхронный перекрывающийся ввод-вывод (`Client -> Server` и `Server -> Client`) полностью успешен через структуры `OVERLAPPED` с явными дескрипторами событий `hEvent`;
+* Системный вызов `CancelIoEx` на клиентском дескрипторе работает штатно;
+* Вызов `SetNamedPipeHandleState` со стороны клиента не требуется (`CLIENT_SET_NAMED_PIPE_HANDLE_STATE_REQUIRED = NO`), так как канал изначально создается сервером как `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE`;
+* Право `READ_CONTROL` клиенту не требуется (`CLIENT_READ_CONTROL_REQUIRED = NO`), так как клиенту `palka-tray` не требуется считывать дескриптор безопасности канала;
+* Право `SYNCHRONIZE` на уровне клиентского запроса `CreateFileW` явно запрашивать не требуется (`CLIENT_SYNCHRONIZE_ACCESS_REQUIRED_FOR_OVERLAPPED_IO = NO`), поскольку асинхронное ожидание осуществляется на дескрипторах событий `hEvent`;
+* Однако на стороне сервера драйвер файловой системы именованных каналов ядра (`NPFS`) при создании клиентского дескриптора проверяет наличие у вызывающего прав `FILE_READ_ATTRIBUTES` (0x00000080) и `SYNCHRONIZE` (0x00100000). Если серверный DACL ограничен только правами `0x00000003`, ядро Windows завершает `CreateFileW` отказом в доступе (`ERROR_ACCESS_DENIED` / код 5);
+* Минимально доказанным и достаточным серверным грантом в DACL является маска `0x00100083`.
+
+Явные маски доступа:
+* **`CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK = 0x00100083`** (грант в DACL сервера ядра):
+  - `FILE_READ_DATA` (0x00000001) — чтение ответов и событий;
+  - `FILE_WRITE_DATA` (0x00000002) — запись запросов;
+  - `FILE_READ_ATTRIBUTES` (0x00000080) — системное чтение атрибутов канала ядром при подключении;
+  - `SYNCHRONIZE` (0x00100000) — системная поддержка синхронизации ядра Windows.
+* **Запрещенные и непредоставляемые права в серверном DACL ребенка**:
+  - `CHILD_PIPE_DACL_FILE_CREATE_PIPE_INSTANCE = NOT_GRANTED` (0x00000004);
+  - `CHILD_PIPE_DACL_FILE_APPEND_DATA = NOT_GRANTED` (0x00000004);
+  - `CHILD_PIPE_DACL_FILE_WRITE_ATTRIBUTES = NOT_GRANTED` (0x00000100);
+  - `CHILD_PIPE_DACL_READ_CONTROL = NOT_GRANTED` (0x00020000);
+  - `CHILD_PIPE_FORBIDDEN_ACCESS_MASK = 0x00000004 (FILE_CREATE_PIPE_INSTANCE / FILE_APPEND_DATA), WRITE_DAC (0x00040000), WRITE_OWNER (0x00080000), DELETE (0x00010000), GENERIC_ALL, GENERIC_WRITE`.
+
+Канонический защищенный SDDL-шаблон:
+```text
+D:P(D;;GA;;;AN)(D;;GA;;;NU)(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x100083;;;{child_sid})
+```
+Где:
+* `D:P` — защищенный DACL (`SE_DACL_PROTECTED`), отключающий наследование от родительского каталога;
+* `(D;;GA;;;AN)` — явный отказ анонимным подключениям;
+* `(D;;GA;;;NU)` — явный отказ сетевым подключениям;
+* `(A;;FA;;;SY)` — полный доступ LocalSystem;
+* `(A;;FA;;;BA)` — полный доступ Builtin Administrators;
+* `(A;;0x100083;;;{child_sid})` — явный доступ ребенка строго по минимально доказанной маске `CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK`.
+
+#### Точная маска DesiredAccess для клиента ребенка при вызове CreateFileW:
+Так как защищенный DACL сервера намеренно исключает `GENERIC_WRITE`, `FILE_GENERIC_WRITE`, `FILE_APPEND_DATA` и `FILE_CREATE_PIPE_INSTANCE`, клиентский модуль ребенка (`palka-tray`) **НЕ ИМЕЕТ ПРАВА** открывать канал с использованием составного флага `GENERIC_READ | GENERIC_WRITE`. Вызов с `GENERIC_WRITE` приведет к ошибке `ERROR_ACCESS_DENIED` на уровне ядра.
+
+Клиент ребенка обязан открывать канал вызовом `CreateFileW` со строго минимальной специфической маской прав на передачу данных:
+```text
+CHILD_PIPE_CLIENT_DESIRED_ACCESS_MASK = 0x00000003
+CHILD_PIPE_CLIENT_GENERIC_READ = NOT_REQUIRED
+CHILD_PIPE_CLIENT_GENERIC_WRITE = FORBIDDEN
+CHILD_PIPE_CLIENT_FILE_CREATE_PIPE_INSTANCE = NOT_REQUESTED
+CHILD_PIPE_CLIENT_FILE_APPEND_DATA = NOT_REQUESTED
+CHILD_PIPE_CLIENT_FILE_READ_ATTRIBUTES = NOT_REQUESTED
+CHILD_PIPE_CLIENT_FILE_WRITE_ATTRIBUTES = NOT_REQUESTED
+CHILD_PIPE_CLIENT_READ_CONTROL = NOT_REQUESTED
+CHILD_PIPE_CLIENT_SYNCHRONIZE = NOT_REQUESTED
+CLIENT_OVERLAPPED_FLAG = FILE_FLAG_OVERLAPPED
+SERVER_DACL_CLIENT_MASK_EQUAL = NO
+```
+Декомпозиция клиентской маски:
+* `FILE_READ_DATA` (0x00000001) — чтение ответов и событий;
+* `FILE_WRITE_DATA` (0x00000002) — отправка запросов.
+
+Асинхронный режим запрашивается отдельно через флаг `dwFlagsAndAttributes = FILE_FLAG_OVERLAPPED`.
+
+#### Обязательность Child SID и валидация против SDDL-инъекций:
+```text
+CHILD_SID_REQUIRED = YES
+RAW_SID_DIRECT_SDDL_INTERPOLATION = FORBIDDEN
+```
+1. **Обязательность для боевого канала**: Для создания канонического боевого канала `\\.\pipe\palka_ipc_v1` параметр `child_sid` является строго обязательным (`ValidatedSid` / `ConfiguredChildSid` или обязательный `&str`, проверяемый немедленно). Использование `Option<&str>` как штатного контракта боевого канала запрещено. При отсутствии, пустоте или невалидности SID создание канала завершается ошибкой (`Fail-Closed`). Никаких fallback DACL или создания канала без ACE ребенка не допускается.
+2. **Валидация через Win32 API**: Простой проверки префикса `S-1-` недостаточно. Входная строка SID обязана валидироваться через системный вызов `ConvertStringSidToSidW` с преобразованием в канонический `PSID`, после чего каноническая строка SID извлекается через `ConvertSidToStringSidW`. Прямая конкатенация непроверенного пользовательского ввода в SDDL строго запрещена.
+
+### 8.2. Детерминированный порядок имперсонации, пребуферизация префикса и RevertToSelf
+DACL является лишь первой линией защиты ядра. Сам по себе DACL не идентифицирует роль клиента.
+
+#### Устранение неоднозначности момента вызова `ImpersonateNamedPipeClient`:
+В соответствии с системной моделью Windows Named Pipe контекст безопасности клиента связывается с данными, физически считанными из канала. Вызов `ImpersonateNamedPipeClient` непосредственно после `ConnectNamedPipe` до первого чтения данных является недокументированным.
+
+Для обеспечения стабильности, безопасности и соответствия байт-ориентированной модели канала (`PIPE_TYPE_BYTE` / `PIPE_READMODE_BYTE`) устанавливается следующий строгий порядок:
+
+```text
+INITIAL_FRAME_PREFIX_BYTES = 4
+INITIAL_FRAME_PREFIX_ENDIANNESS = LITTLE_ENDIAN
+INITIAL_FRAME_PREFIX_DECODER = u32::from_le_bytes
+PREFIX_READ_STYLE = CANCELLABLE_OVERLAPPED_READ_EXACT
+PARTIAL_PREFIX_FAIL_CLOSED = YES
+PREBUFFER_BYTE_PRESERVATION = EXACT
+MAX_INITIAL_CLIENT_REQUEST_BYTES = 65536
+INITIAL_REQUEST_LENGTH_MIN = 1
+INITIAL_REQUEST_LENGTH_MAX = 65536
+ZERO_LENGTH_INITIAL_REQUEST = REJECT
+OVERSIZED_INITIAL_REQUEST = FRAME_TOO_LARGE
+PREFIX_LIMIT_CHECK_BEFORE_BODY_READ = YES
+PREFIX_LIMIT_CHECK_BEFORE_BODY_ALLOCATION = YES
+MAY_READ_BEFORE_AUTHORIZATION = ONLY_FIXED_4_BYTE_PREFIX
+MUST_NOT_READ_BEFORE_AUTHORIZATION = FRAME_BODY
+MUST_NOT_ALLOCATE_FROM_DECLARED_LENGTH = YES
+```
+
+1. **Завершение подключения**: Успешное завершение `ConnectNamedPipe` (клиент подключен к экземпляру канала);
+2. **Ограниченное первичное чтение префикса длины (`bounded initial transport read`) и ранняя валидация**:
+   * Транспорт обязан гарантированно считать ровно 4 байта длины первого фрейма (`PREFIX_READ_TARGET_BYTES = 4`), используя перекрывающиеся отменяемые вызовы `ReadFile` (`PREFIX_READ_STYLE = CANCELLABLE_OVERLAPPED_READ_EXACT`). Так как канал работает в режиме потока байт (`PIPE_READMODE_BYTE`), один вызов `ReadFile` не гарантирует единовременного возврата всех 4 байт, поэтому транспорт накапливает байты до достижения ровно 4 байт;
+   * Если до накопления 4 байт происходит обрыв связи, ошибка или EOF — соединение немедленно закрывается по принципу `Fail-Closed` (`PARTIAL_PREFIX_FAIL_CLOSED = YES`). Никакая имперсонация по частичному префиксу, парсинг протокола или аллокации не производятся;
+   * Длина фрейма декодируется как 4-байтовое беззнаковое целое в формате **Little-Endian**: `N = u32::from_le_bytes([b0, b1, b2, b3])`;
+   * Первым фреймом, передаваемым клиентом в службу, всегда является **запрос** (`REQUEST`), поэтому для проверки допустимой длины применяется нормативный предел запроса `MAX_INITIAL_CLIENT_REQUEST_BYTES = 65536` (64 КиБ):
+     - Если `N == 0` — отказ (`ZERO_LENGTH_INITIAL_REQUEST = REJECT`), соединение закрывается;
+     - Если `N > 65536` — отказ (`OVERSIZED_INITIAL_REQUEST = FRAME_TOO_LARGE`), соединение закрывается;
+     - Если `1 <= N <= 65536` — префикс длины валиден, процедура проверки контекста безопасности продолжается;
+   * **Барьер ресурсов до авторизации**: Проверка лимита длины выполняется строго ДО чтения тела фрейма (`PREFIX_LIMIT_CHECK_BEFORE_BODY_READ = YES`) и строго ДО выделения памяти (`PREFIX_LIMIT_CHECK_BEFORE_BODY_ALLOCATION = YES`). До успешного извлечения контекста безопасности и авторизации служба категорически **НЕ ЧИТАЕТ ТЕЛО ФРЕЙМА** (`MUST_NOT_READ_BEFORE_AUTHORIZATION = FRAME_BODY`) и **НЕ ВЫДЕЛЯЕТ ПАМЯТЬ ПОД РАЗМЕР ТЕЛА** (`MUST_NOT_ALLOCATE_FROM_DECLARED_LENGTH = YES`);
+3. **Точное сохранение пребуфера (`PREBUFFER_BYTE_PRESERVATION = EXACT`)**: Накопленные ровно 4 байта префикса сохраняются без байтовых перестановок и мутаций в буфере предварительного чтения (`prebuffer`) соединения, чтобы они были прозрачно и без потерь переданы кодеку `palka-ipc-protocol`;
+4. **Имперсонация после физического чтения**: Только после того как 4 байта префикса физически считаны из канала, вызывается `ImpersonateNamedPipeClient(pipe_handle)`;
+5. **Открытие маркера потока**: Маркер потока открывается через `OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &mut token)`;
+6. **Извлечение низкоуровневых фактов безопасности**:
+   * SID пользователя клиента (`TokenUser`);
+   * Присутствие в группе локальных администраторов (`TokenGroups`);
+   * `TokenSessionId`;
+   * Идентификатор процесса клиента PID (`GetNamedPipeClientProcessId`);
+7. **Безусловный вызов `RevertToSelf()`**: Сброс контекста имперсонации выполняется немедленно после извлечения фактов и строго ДО любого чтения тела фрейма, парсинга JSON или доменной обработки;
+8. **Возврат соединения**: Возврат объекта соединения `NamedPipeConnection` вместе с `ClientSecurityContext` и сохраненным 4-байтовым `prebuffer`;
+9. **Авторизация и чтение тела**: Верхний уровень `palka-service` проверяет соответствие `ClientSecurityContext` авторизационной матрице. Только при успешной авторизации происходит чтение оставшейся части сообщения (тела фрейма) из канала и парсинг JSON DTO кодеком. При отказе авторизации соединение немедленно закрывается (`Fail-Closed`).
+
+#### Политика обработки сбоя RevertToSelf:
+```text
+REVERT_TO_SELF_FAILURE_POLICY = PROCESS_FATAL
+```
+Если после успешной имперсонации системный вызов `RevertToSelf()` завершается ошибкой, процесс службы **НЕ ИМЕЕТ ПРАВА** продолжать выполнение в контексте безопасности клиента. Процесс службы обязан немедленно аварийно завершиться (fail-fast / `std::process::abort()`). Подавление ошибки или игнорирование результата `RevertToSelf` в RAII-страже (`Drop`) категорически запрещено.
+
+#### Разделение ответственности между транспортом и сервисом:
+Транспортный уровень `palka-windows-platform` (Срез 2) извлекает исключительно объективные факты ОС:
+* `user_sid: String`
+* `is_local_administrator: bool`
+* `client_process_id: u32`
+* `client_session_id: u32`
+
+`palka-windows-platform` **НЕ ПРИНИМАЕТ** решений о ролях `CONFIGURED_CHILD`, правах учетной записи `SYSTEM`, проверке PIN-кода или допуске конкретных DTO-запросов. Вся авторизационная политика принадлежит `palka-service` (Срез 4). Единственным исключением на уровне транспорта является использование `child_sid` для конструирования дескриптора безопасности ядра DACL.
 
 > [!NOTE]
 > Идентификатор сессии `TokenSessionId` в V1 может логироваться в целях диагностики, но **НЕ ЯВЛЯЕТСЯ** жестким авторизационным ключом, чтобы избежать хрупкости при быстром переключении пользователей (Fast User Switching). Авторизационным свидетельством является проверенный SID, полученный из access token клиента, и соответствующий контекст безопасности Windows.
-
 ### 8.3. Нормативная матрица авторизации запросов V1 (Client Authorization Matrix)
 
 | Запрос клиента (IPC Request) | CONFIGURED_CHILD | LOCAL_ADMINISTRATOR | NT AUTHORITY\SYSTEM | UNEXPECTED_LOCAL / ANONYMOUS / NETWORK / REMOTE |
@@ -705,13 +847,15 @@ graph TD
    * Определение конвертов, DTO, кодека фрейминга, лимитов размеров, конвертеров в/из `palka-core`;
 2. **Срез 2 (`SLICE 2: WINDOWS_NAMED_PIPE_TRANSPORT`)**:
    * Добавление фич `Win32_System_Pipes` и `Win32_System_IO` в `crates/windows-platform`;
-   * Реализация низкоуровневых оберток канала, DACL, перекрывающегося ввода-вывода и `CancelIoEx`;
+   * Реализация низкоуровневых оберток канала, защищенного DACL с маской `CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK = 0x00100083` без права создания экземпляров канала, обязательного Child SID с валидацией, безопасной последовательности ограниченного предварительного чтения 4-байтового Little-Endian префикса длины (`u32::from_le_bytes`) с защитой от частичного чтения и аллокаций до авторизации, имперсонации, fail-fast RevertToSelf, перекрывающегося ввода-вывода и `CancelIoEx`;
+   * Статус: `SLICE_2_IMPLEMENTATION_STATUS = NOT_STARTED`, `SLICE_2_IMPLEMENTATION_READY = PENDING_INDEPENDENT_FINAL_CONTRACT_AUDIT`;
 3. **Срез 3 (`SLICE 3: RUNTIME_IPC_SEAMS`)**:
    * Добавление в `ServiceRuntime` швов точной отмены таймеров, атомарного сохранения сообщений ребенка в outbox, типизированного вещателя событий и атомарного барьера подписки;
 4. **Срез 4 (`SLICE 4: SERVICE_IPC_SERVER_AND_AUTH`)**:
    * Реализация серверного супервизора IPC в `palka-service`, проверка Windows security context / access token клиента, классификация SID/role и connection-bound PIN authorization state, деградация и координированная остановка по сигналу SCM;
 5. **Срез 5 (`SLICE 5: TRAY_IPC_CLIENT`)**:
-   * Реализация клиентской обвязки в `palka-tray`: командный канал и поток событий.
+   * Реализация клиентской обвязки в `palka-tray`: командный канал и поток событий;
+   * Вызов `CreateFileW` клиентом ребенка с использованием точной минимальной маски данных `CHILD_PIPE_CLIENT_DESIRED_ACCESS_MASK = 0x00000003` с флагом `FILE_FLAG_OVERLAPPED`, без запроса `GENERIC_WRITE` и без `FILE_CREATE_PIPE_INSTANCE`.
 
 ---
 
@@ -776,8 +920,8 @@ graph TD
 | **IPC-55** | Попытка верификации PIN или мутаций от имени `SYSTEM` отвергается | `UNIT` |
 | **IPC-56** | Неожиданный локальный SID немедленно отключается по принципу `Fail-Closed` | `UNIT` |
 | **IPC-57** | Канал отвергает удаленных клиентов флагом `PIPE_REJECT_REMOTE_CLIENTS` | `WINDOWS_INTEGRATION_REQUIRED` |
-| **IPC-58** | Дескриптор DACL физически ограничивает доступ на уровне ядра Windows | `WINDOWS_INTEGRATION_REQUIRED` |
-| **IPC-59** | Вызов `RevertToSelf` гарантированно выполняется на всех путях после имперсонации | `WINDOWS_INTEGRATION_REQUIRED` |
+| **IPC-58** | Дескриптор DACL физически ограничивает доступ на уровне ядра Windows: разрешает клиенту ребенка в DACL строго права чтения/записи/атрибутов/синхронизации (каноническая маска 0x00100083) и исключает право создания экземпляров канала (FILE_CREATE_PIPE_INSTANCE / FILE_APPEND_DATA) | WINDOWS_INTEGRATION_REQUIRED |
+| **IPC-59** | Вызов `RevertToSelf` гарантированно выполняется на всех путях после имперсонации, а отказ RevertToSelf является фатальным для процесса (PROCESS_FATAL / fail-fast) | WINDOWS_INTEGRATION_REQUIRED |
 | **IPC-60** | Серверный дескриптор канала создается с обязательным флагом `FILE_FLAG_OVERLAPPED` | `WINDOWS_INTEGRATION_REQUIRED` |
 | **IPC-61** | Зависшая операция `ConnectNamedPipe` прерывается вызовом `CancelIoEx` при остановке | `WINDOWS_INTEGRATION_REQUIRED` |
 | **IPC-62** | Зависшая операция `ReadFile` прерывается вызовом `CancelIoEx` при остановке | `WINDOWS_INTEGRATION_REQUIRED` |
