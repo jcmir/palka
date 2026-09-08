@@ -9,12 +9,18 @@ pub mod persistence;
 pub mod persistent_root;
 pub mod pin_auth;
 pub mod runtime;
+pub mod service_integration;
 pub mod state_store;
 pub mod windows_id_source;
 pub mod windows_internet_gate;
 pub mod windows_power_controller;
 
 pub use bootstrap::{BootstrappedServiceState, ServiceBootstrapError, bootstrap_service};
+pub use service_integration::{
+    ProductionBootstrap, ProductionRuntimeFactory, START_WAIT_HINT_MS, STOP_WAIT_HINT_MS,
+    ServiceBootstrapPort, ServiceIntegrationError, ServiceLifecyclePort, ServiceRuntimeFactory,
+    ServiceRuntimeLifecyclePort, palka_service_entry, run_service_with_ports,
+};
 
 pub use config_persistence::{
     CONFIG_SCHEMA_VERSION_V1, ConfigPersistenceError, PersistentConfig, decode_config_json,
