@@ -19,10 +19,10 @@ use crate::state_store::{StateFileStore, StateStoreError};
 use palka_core::{
     ActionExecutionState, ActionKind, ChatMessage, Deadline, DeliveryStatus, DesiredInternetState,
     Event, HealthStatus, Initiator, InternetState, MessageId, MessageSender, ScheduledAction,
-    ServiceHealth, ShutdownState, StatusSnapshot, TimerId, UtcDateTime, WarningThreshold,
-    creation_due_thresholds, creation_passed_thresholds, crossed_warning_thresholds,
-    execution_failure_transition, execution_success_transition, recovery_overdue_transition,
-    recovery_passed_thresholds, runtime_deadline_transition,
+    ServiceHealth, ShutdownState, StateChangeReason, StatusSnapshot, TimerId, UtcDateTime,
+    WarningEvent, WarningThreshold, creation_due_thresholds, creation_passed_thresholds,
+    crossed_warning_thresholds, execution_failure_transition, execution_success_transition,
+    recovery_overdue_transition, recovery_passed_thresholds, runtime_deadline_transition,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -504,6 +504,35 @@ fn checked_prospective_active_session_count(
     u32::try_from(prospective_len).map_err(|_| ServiceRuntimeError::SubscriptionCapacityExhausted)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeaningfulHealthSignature {
+    pub status: HealthStatus,
+    pub internet_gate_healthy: bool,
+    pub persistence_healthy: bool,
+    pub telegram_connected: bool,
+    pub active_tray_sessions: u32,
+    pub last_error: Option<String>,
+}
+
+fn derive_shutdown_state(
+    current_state: ShutdownState,
+    active_actions: &[ScheduledAction],
+) -> ShutdownState {
+    if current_state == ShutdownState::InProgress {
+        ShutdownState::InProgress
+    } else if active_actions.iter().any(|a| {
+        a.action_kind == ActionKind::ShutdownComputer
+            && matches!(
+                a.execution_state,
+                ActionExecutionState::Pending | ActionExecutionState::Executing
+            )
+    }) {
+        ShutdownState::Scheduled
+    } else {
+        ShutdownState::Idle
+    }
+}
+
 impl<S, G, P, C, I, R> ServiceRuntimeCoordinator<S, G, P, C, I, R>
 where
     S: RuntimeStateStore,
@@ -610,29 +639,91 @@ where
             self.health.last_error = None;
         }
     }
+    fn meaningful_health_signature(&self) -> MeaningfulHealthSignature {
+        MeaningfulHealthSignature {
+            status: self.health.status,
+            internet_gate_healthy: self.health.internet_gate_healthy,
+            persistence_healthy: self.health.persistence_healthy,
+            telegram_connected: self.health.telegram_connected,
+            active_tray_sessions: self.health.active_tray_sessions,
+            last_error: self.health.last_error.clone(),
+        }
+    }
+
+    fn mutate_health_and_maybe_emit<F>(&mut self, mutate: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let before = self.meaningful_health_signature();
+        mutate(self);
+        self.recompute_health_status();
+        let after = self.meaningful_health_signature();
+        if before != after {
+            let health = self.build_service_health_snapshot();
+            let _ = self.emit_event(Event::ServiceHealthUpdated { health });
+        }
+    }
+
+    fn sync_shutdown_state_local(&mut self) -> (ShutdownState, ShutdownState) {
+        let prev = self.shutdown_state;
+        self.shutdown_state =
+            derive_shutdown_state(self.shutdown_state, &self.state.active_actions);
+        (prev, self.shutdown_state)
+    }
+
+    fn maybe_emit_shutdown_state_changed(
+        &mut self,
+        previous: ShutdownState,
+        current: ShutdownState,
+    ) {
+        if previous != current {
+            let _ = self.emit_event(Event::ShutdownStateChanged { previous, current });
+        }
+    }
+
+    fn maybe_emit_internet_policy_changed(
+        &mut self,
+        previous_desired: DesiredInternetState,
+        previous_observed: InternetState,
+        reason: StateChangeReason,
+    ) {
+        let current_desired = self.state.desired_internet_state;
+        let current_observed = self.observed_internet_state;
+        if (previous_desired, previous_observed) != (current_desired, current_observed) {
+            let _ = self.emit_event(Event::InternetPolicyChanged {
+                desired: current_desired,
+                observed: current_observed,
+                reason,
+            });
+        }
+    }
 
     fn mark_persistence_failure(&mut self, err: &StateStoreError) {
-        self.health.persistence_healthy = false;
-        self.persistence_error = Some(format!("State store error: {err}"));
-        self.recompute_health_status();
+        self.mutate_health_and_maybe_emit(|s| {
+            s.health.persistence_healthy = false;
+            s.persistence_error = Some(format!("State store error: {err}"));
+        });
     }
 
     fn mark_persistence_success(&mut self) {
-        self.health.persistence_healthy = true;
-        self.persistence_error = None;
-        self.recompute_health_status();
+        self.mutate_health_and_maybe_emit(|s| {
+            s.health.persistence_healthy = true;
+            s.persistence_error = None;
+        });
     }
 
     fn mark_gate_failure(&mut self, err_msg: String) {
-        self.health.internet_gate_healthy = false;
-        self.internet_gate_error = Some(err_msg);
-        self.recompute_health_status();
+        self.mutate_health_and_maybe_emit(|s| {
+            s.health.internet_gate_healthy = false;
+            s.internet_gate_error = Some(err_msg);
+        });
     }
 
     fn mark_gate_success(&mut self) {
-        self.health.internet_gate_healthy = true;
-        self.internet_gate_error = None;
-        self.recompute_health_status();
+        self.mutate_health_and_maybe_emit(|s| {
+            s.health.internet_gate_healthy = true;
+            s.internet_gate_error = None;
+        });
     }
 
     fn flush_pending_durable_candidate(&mut self) -> Result<(), StateStoreError> {
@@ -704,6 +795,7 @@ where
 
         let mut actions_to_remove = Vec::new();
         let mut recovered_overdue_block_ids = Vec::new();
+        let mut missed_shutdown_snapshots = Vec::new();
 
         // 1. Process active actions recovered from state.json
         for action in &mut candidate.active_actions {
@@ -758,6 +850,8 @@ where
                             Some(next @ ActionExecutionState::Missed) => {
                                 action.execution_state = next;
                                 actions_to_remove.push(action.id);
+
+                                missed_shutdown_snapshots.push(action.clone());
 
                                 let entry_id = self.id_source.next_outbox_id();
                                 candidate.telegram_outbox.push(TelegramOutboxEntry {
@@ -819,7 +913,22 @@ where
                 .map_err(ServiceRuntimeError::Persistence)?;
         }
 
+        // Emit MissedDeadlineOccurred events after durable recovery commit
+        for missed_snapshot in missed_shutdown_snapshots {
+            let _ = self.emit_event(Event::MissedDeadlineOccurred {
+                action: missed_snapshot,
+                reason: "Scheduled shutdown was missed while service was offline".to_string(),
+            });
+        }
+
+        // Startup Shutdown Aggregate synchronization & event
+        let (prev_shutdown, curr_shutdown) = self.sync_shutdown_state_local();
+        self.maybe_emit_shutdown_state_changed(prev_shutdown, curr_shutdown);
+
         // 2. Initial Internet Reconciliation
+        let prev_desired = self.state.desired_internet_state;
+        let prev_observed = self.observed_internet_state;
+
         let child_sid = self.bootstrapped.config.child_sid.clone();
         let reconciliation_result = match self.state.desired_internet_state {
             DesiredInternetState::Blocked => {
@@ -838,6 +947,12 @@ where
             Ok(obs) => self.observed_internet_state = *obs,
             Err(_) => self.observed_internet_state = InternetState::Unknown,
         }
+
+        self.maybe_emit_internet_policy_changed(
+            prev_desired,
+            prev_observed,
+            StateChangeReason::StartupRestoration,
+        );
 
         let mut degraded = false;
         let mut last_error_msg = None;
@@ -968,14 +1083,16 @@ where
         let delay = self.retry_policy.delay_for_attempt(attempt);
         if delay.is_zero() {
             // Defend against zero-delay busy loop (Section 9)
-            self.retry_policy_error =
-                Some("InternetRetryPolicy returned invalid zero delay".to_string());
+            self.mutate_health_and_maybe_emit(|s| {
+                s.retry_policy_error =
+                    Some("InternetRetryPolicy returned invalid zero delay".to_string());
+            });
             self.next_retry_at = None;
-            self.recompute_health_status();
         } else {
-            self.retry_policy_error = None;
+            self.mutate_health_and_maybe_emit(|s| {
+                s.retry_policy_error = None;
+            });
             self.next_retry_at = Some(self.clock.monotonic_now() + delay);
-            self.recompute_health_status();
         }
     }
 
@@ -1055,6 +1172,8 @@ where
 
     #[allow(dead_code)]
     pub(crate) fn emit_event(&mut self, event: Event) -> Result<(), ServiceRuntimeError> {
+        #[cfg(test)]
+        self.log_event(&format!("event:{:?}", event));
         let failed = self.try_send_to_subscribers(&event, None);
         if !failed.is_empty() {
             for id in failed {
@@ -1302,33 +1421,62 @@ where
             deadline,
             created_at: now_utc,
             created_by: initiator,
-            emitted_thresholds,
             execution_state: ActionExecutionState::Pending,
+            emitted_thresholds,
         };
 
-        // Candidate state: Durable-Before-Ack
         let mut candidate = self.state.clone();
-        candidate.active_actions.push(scheduled_action);
+        candidate.active_actions.push(scheduled_action.clone());
         candidate.telegram_outbox.extend(new_outbox);
 
         self.log_event("save:schedule_action");
         self.commit_authoritative_state(candidate)
             .map_err(ServiceRuntimeError::Persistence)?;
 
-        // Register monotonic timer anchor
-        let duration = Duration::from_secs(duration_seconds as u64);
+        let target_instant = now_mono + Duration::from_secs(duration_seconds.into());
         self.monotonic_timers.insert(
             timer_id,
             MonotonicTimerAnchor {
                 timer_id,
                 action_kind,
                 utc_deadline: deadline,
-                monotonic_target: now_mono + duration,
-                original_duration_seconds: duration_seconds as u64,
+                monotonic_target: target_instant,
+                original_duration_seconds: duration_seconds.into(),
                 monotonic_start: now_mono,
-                last_evaluated_remaining_seconds: duration_seconds as u64,
+                last_evaluated_remaining_seconds: duration_seconds.into(),
             },
         );
+
+        // Emit TimerScheduled with exact persisted ScheduledAction
+        let persisted_action = self
+            .state
+            .active_actions
+            .iter()
+            .find(|a| a.id == timer_id)
+            .cloned()
+            .unwrap_or(scheduled_action);
+        let _ = self.emit_event(Event::TimerScheduled {
+            action: persisted_action,
+        });
+
+        // Emit creation-time due warnings
+        for threshold in due {
+            let _ = self.emit_event(Event::WarningThresholdReached {
+                event: WarningEvent {
+                    timer_id,
+                    action_kind,
+                    threshold,
+                    deadline,
+                    emitted_at: now_utc,
+                },
+            });
+        }
+
+        // If ShutdownComputer, synchronize aggregate and emit if changed
+        if action_kind == ActionKind::ShutdownComputer {
+            let (prev, curr) = self.sync_shutdown_state_local();
+            self.maybe_emit_shutdown_state_changed(prev, curr);
+        }
 
         Ok(timer_id)
     }
@@ -1407,12 +1555,20 @@ where
             action_kind: expected_action_kind,
         });
 
+        // If ShutdownComputer, synchronize aggregate and emit if changed
+        if expected_action_kind == ActionKind::ShutdownComputer {
+            let (prev, curr) = self.sync_shutdown_state_local();
+            self.maybe_emit_shutdown_state_changed(prev, curr);
+        }
+
         // Step 8: Return Cancelled
         Ok(TimerCancellationResult::Cancelled)
     }
 
-    fn handle_immediate_block(&mut self, _initiator: Initiator) -> Result<(), ServiceRuntimeError> {
-        // Candidate: Durable-Before-Side-Effect
+    fn handle_immediate_block(&mut self, initiator: Initiator) -> Result<(), ServiceRuntimeError> {
+        let prev_desired = self.state.desired_internet_state;
+        let prev_observed = self.observed_internet_state;
+
         let mut candidate = self.state.clone();
         candidate.desired_internet_state = DesiredInternetState::Blocked;
 
@@ -1443,8 +1599,15 @@ where
             self.observed_internet_state = InternetState::Unknown;
         }
 
+        self.maybe_emit_internet_policy_changed(
+            prev_desired,
+            prev_observed,
+            StateChangeReason::ImmediateCommand { initiator },
+        );
+
         match (block_res, current_res) {
             (Ok(()), Ok(obs)) if obs == InternetState::Blocked => {
+                self.mark_gate_success();
                 if self.state.internet_retry.is_some() {
                     let mut c = self.state.clone();
                     c.internet_retry = None;
@@ -1452,7 +1615,6 @@ where
                     self.commit_post_side_effect_candidate(c)
                         .map_err(ServiceRuntimeError::Persistence)?;
                 }
-                self.mark_gate_success();
                 Ok(())
             }
             (Ok(()), Ok(obs)) => {
@@ -1505,10 +1667,10 @@ where
         Err(ServiceRuntimeError::Platform(PlatformError::new(err_msg)))
     }
 
-    fn handle_restore_internet(
-        &mut self,
-        _initiator: Initiator,
-    ) -> Result<(), ServiceRuntimeError> {
+    fn handle_restore_internet(&mut self, initiator: Initiator) -> Result<(), ServiceRuntimeError> {
+        let prev_desired = self.state.desired_internet_state;
+        let prev_observed = self.observed_internet_state;
+
         // Candidate: Durable-Before-Side-Effect
         let mut candidate = self.state.clone();
         candidate.desired_internet_state = DesiredInternetState::Unrestricted;
@@ -1540,8 +1702,15 @@ where
             self.observed_internet_state = InternetState::Unknown;
         }
 
+        self.maybe_emit_internet_policy_changed(
+            prev_desired,
+            prev_observed,
+            StateChangeReason::ManualRestore { initiator },
+        );
+
         match (unblock_res, current_res) {
             (Ok(()), Ok(obs)) if obs == InternetState::Unrestricted => {
+                self.mark_gate_success();
                 if self.state.internet_retry.is_some() {
                     let mut c = self.state.clone();
                     c.internet_retry = None;
@@ -1549,7 +1718,6 @@ where
                     self.commit_post_side_effect_candidate(c)
                         .map_err(ServiceRuntimeError::Persistence)?;
                 }
-                self.mark_gate_success();
                 Ok(())
             }
             (Ok(()), Ok(obs)) => {
@@ -1692,10 +1860,17 @@ where
         // 1. Evaluate warning thresholds (Sections 12 & 19: do not advance cursor on failure!)
         let timer_keys: Vec<_> = self.monotonic_timers.keys().copied().collect();
         for timer_id in timer_keys {
-            let (is_expired, action_kind, previous, current, crossed) = {
+            let (is_expired, action_kind, anchor_deadline, previous, current, crossed) = {
                 if let Some(anchor) = self.monotonic_timers.get(&timer_id) {
                     if now_mono >= anchor.monotonic_target {
-                        (true, anchor.action_kind, 0, 0, Vec::new())
+                        (
+                            true,
+                            anchor.action_kind,
+                            anchor.utc_deadline,
+                            0,
+                            0,
+                            Vec::new(),
+                        )
                     } else {
                         let elapsed = now_mono.saturating_duration_since(anchor.monotonic_start);
                         let remaining = anchor
@@ -1718,7 +1893,14 @@ where
                         } else {
                             Vec::new()
                         };
-                        (false, anchor.action_kind, previous, current, crossed)
+                        (
+                            false,
+                            anchor.action_kind,
+                            anchor.utc_deadline,
+                            previous,
+                            current,
+                            crossed,
+                        )
                     }
                 } else {
                     continue;
@@ -1750,12 +1932,24 @@ where
                         });
                     }
 
-                    self.log_event("save:warning_threshold");
+                    self.log_event("save:runtime_warning");
                     match self.commit_authoritative_state(candidate) {
                         Ok(()) => {
                             // ONLY advance the anchor cursor after save succeeds!
                             if let Some(anchor) = self.monotonic_timers.get_mut(&timer_id) {
                                 anchor.last_evaluated_remaining_seconds = current;
+                            }
+                            let now_utc = self.clock.utc_now();
+                            for threshold in crossed {
+                                let _ = self.emit_event(Event::WarningThresholdReached {
+                                    event: WarningEvent {
+                                        timer_id,
+                                        action_kind,
+                                        threshold,
+                                        deadline: anchor_deadline,
+                                        emitted_at: now_utc,
+                                    },
+                                });
                             }
                         }
                         Err(_) => {
@@ -1804,142 +1998,162 @@ where
             return;
         }
 
+        let prev_desired = self.state.desired_internet_state;
+        let prev_observed = self.observed_internet_state;
+
         let mut candidate = self.state.clone();
-        if let Some(action) = candidate
+        let act = match candidate
             .active_actions
             .iter_mut()
             .find(|a| a.id == timer_id)
         {
-            if let Some(next_state) = runtime_deadline_transition(&action.execution_state, 0) {
-                action.execution_state = next_state;
-                candidate.desired_internet_state = DesiredInternetState::Blocked;
+            Some(a) => a,
+            None => return,
+        };
 
-                self.log_event("save:scheduled_block_executing");
-                if let Err(e) = self.commit_authoritative_state(candidate) {
-                    self.mark_persistence_failure(&e);
-                    return;
-                }
+        let executing_state = match runtime_deadline_transition(&act.execution_state, 0) {
+            Some(s @ ActionExecutionState::Executing) => s,
+            _ => return,
+        };
 
-                // Section 4: Only after durable transition succeeds may the volatile anchor be retired
-                self.monotonic_timers.remove(&timer_id);
+        act.execution_state = executing_state;
+        candidate.desired_internet_state = DesiredInternetState::Blocked;
 
-                #[cfg(test)]
-                if let Some(ref hook) = self.pre_effect_hook {
-                    hook();
-                }
+        self.log_event("save:scheduled_internet_executing");
+        if self.commit_authoritative_state(candidate).is_err() {
+            return;
+        }
 
-                let child_sid = self.bootstrapped.config.child_sid.clone();
-                let (block_res, current_res) = {
-                    let _gate = self.platform_effect_gate.lock().unwrap();
-                    if self.is_stop_requested() {
-                        return;
-                    }
-                    self.log_event("gate:block_internet");
-                    let b_res = self.gate.block_internet(&child_sid);
-                    let c_res = self.gate.current_state(&child_sid);
-                    (b_res, c_res)
-                };
+        self.monotonic_timers.remove(&timer_id);
 
-                if let Ok(obs) = &current_res {
-                    self.observed_internet_state = *obs;
-                } else {
-                    self.observed_internet_state = InternetState::Unknown;
-                }
+        let _ = self.emit_event(Event::TimerExpired {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+        });
 
-                let mut post_candidate = self.state.clone();
+        #[cfg(test)]
+        if let Some(ref hook) = self.pre_effect_hook {
+            hook();
+        }
+
+        let child_sid = self.bootstrapped.config.child_sid.clone();
+        let (block_res, current_res) = {
+            let _gate = self.platform_effect_gate.lock().unwrap();
+            if self.is_stop_requested() {
+                return;
+            }
+            self.log_event("gate:block_internet");
+            let b_res = self.gate.block_internet(&child_sid);
+            let c_res = self.gate.current_state(&child_sid);
+            (b_res, c_res)
+        };
+
+        if let Ok(obs) = &current_res {
+            self.observed_internet_state = *obs;
+        } else {
+            self.observed_internet_state = InternetState::Unknown;
+        }
+
+        self.maybe_emit_internet_policy_changed(
+            prev_desired,
+            prev_observed,
+            StateChangeReason::TimerExpired { timer_id },
+        );
+
+        let mut post_candidate = self.state.clone();
+        match (block_res, current_res) {
+            (Ok(()), Ok(obs)) if obs == InternetState::Blocked => {
+                self.mark_gate_success();
                 if let Some(act) = post_candidate
                     .active_actions
                     .iter_mut()
                     .find(|a| a.id == timer_id)
                 {
-                    match (block_res, current_res) {
-                        (Ok(()), Ok(obs)) if obs == InternetState::Blocked => {
-                            self.observed_internet_state = obs;
-                            self.mark_gate_success();
-                            if let Some(ActionExecutionState::Completed) =
-                                execution_success_transition(&act.execution_state)
-                            {
-                                // Remove Completed terminal action
-                                post_candidate.active_actions.retain(|a| a.id != timer_id);
-                                self.log_event("save:scheduled_block_completed");
-                                let _ = self.commit_post_side_effect_candidate(post_candidate);
-                            }
-                        }
-                        (Ok(()), Ok(obs)) => {
-                            // Verification mismatch! (Section 7)
-                            let err_msg = format!(
-                                "Scheduled block verification mismatch: observed {:?}, expected Blocked",
-                                obs
-                            );
-                            self.handle_scheduled_block_failure(
-                                timer_id,
-                                &mut post_candidate,
-                                err_msg,
-                            );
-                        }
-                        (Err(err), _) => {
-                            self.handle_scheduled_block_failure(
-                                timer_id,
-                                &mut post_candidate,
-                                err.reason,
-                            );
-                        }
-                        (_, Err(err)) => {
-                            self.handle_scheduled_block_failure(
-                                timer_id,
-                                &mut post_candidate,
-                                err.reason,
-                            );
-                        }
+                    if let Some(ActionExecutionState::Completed) =
+                        execution_success_transition(&act.execution_state)
+                    {
+                        post_candidate.active_actions.retain(|a| a.id != timer_id);
                     }
                 }
+                post_candidate.internet_retry = None;
+                self.log_event("save:scheduled_internet_completed");
+                let _ = self.commit_post_side_effect_candidate(post_candidate);
+            }
+            (Ok(()), Ok(obs)) => {
+                let err_msg = format!(
+                    "Scheduled block verification mismatch: observed {:?}, expected Blocked",
+                    obs
+                );
+                self.mark_gate_failure(err_msg.clone());
+                if let Some(act) = post_candidate
+                    .active_actions
+                    .iter_mut()
+                    .find(|a| a.id == timer_id)
+                {
+                    if let Some(next) =
+                        execution_failure_transition(&act.execution_state, err_msg.clone())
+                    {
+                        act.execution_state = next;
+                    }
+                }
+                let attempt = post_candidate
+                    .internet_retry
+                    .as_ref()
+                    .map(|r| r.attempt_count + 1)
+                    .unwrap_or(1);
+                post_candidate.internet_retry = Some(InternetRetry {
+                    attempt_count: attempt,
+                    last_error: Some(err_msg.clone()),
+                });
+                let entry_id = self.id_source.next_outbox_id();
+                post_candidate.telegram_outbox.push(TelegramOutboxEntry {
+                    entry_id,
+                    payload: TelegramPayload::ServiceNotification {
+                        text: format!("Scheduled internet block failed: {}", err_msg),
+                    },
+                    attempt_count: 0,
+                    last_error: None,
+                });
+                self.log_event("save:scheduled_internet_failed");
+                let _ = self.commit_post_side_effect_candidate(post_candidate);
+                self.schedule_next_internet_retry(attempt);
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                self.mark_gate_failure(err.reason.clone());
+                if let Some(act) = post_candidate
+                    .active_actions
+                    .iter_mut()
+                    .find(|a| a.id == timer_id)
+                {
+                    if let Some(next) =
+                        execution_failure_transition(&act.execution_state, err.reason.clone())
+                    {
+                        act.execution_state = next;
+                    }
+                }
+                let attempt = post_candidate
+                    .internet_retry
+                    .as_ref()
+                    .map(|r| r.attempt_count + 1)
+                    .unwrap_or(1);
+                post_candidate.internet_retry = Some(InternetRetry {
+                    attempt_count: attempt,
+                    last_error: Some(err.reason.clone()),
+                });
+                let entry_id = self.id_source.next_outbox_id();
+                post_candidate.telegram_outbox.push(TelegramOutboxEntry {
+                    entry_id,
+                    payload: TelegramPayload::ServiceNotification {
+                        text: format!("Scheduled internet block failed: {}", err.reason),
+                    },
+                    attempt_count: 0,
+                    last_error: None,
+                });
+                self.log_event("save:scheduled_internet_failed");
+                let _ = self.commit_post_side_effect_candidate(post_candidate);
+                self.schedule_next_internet_retry(attempt);
             }
         }
-    }
-
-    fn handle_scheduled_block_failure(
-        &mut self,
-        timer_id: TimerId,
-        candidate: &mut PersistentState,
-        err_msg: String,
-    ) {
-        self.mark_gate_failure(err_msg.clone());
-
-        if let Some(act) = candidate
-            .active_actions
-            .iter_mut()
-            .find(|a| a.id == timer_id)
-        {
-            if let Some(next) = execution_failure_transition(&act.execution_state, err_msg.clone())
-            {
-                act.execution_state = next;
-            }
-        }
-
-        let attempt = candidate
-            .internet_retry
-            .as_ref()
-            .map(|r| r.attempt_count + 1)
-            .unwrap_or(1);
-        candidate.internet_retry = Some(InternetRetry {
-            attempt_count: attempt,
-            last_error: Some(err_msg.clone()),
-        });
-
-        let entry_id = self.id_source.next_outbox_id();
-        candidate.telegram_outbox.push(TelegramOutboxEntry {
-            entry_id,
-            payload: TelegramPayload::ServiceNotification {
-                text: format!("Scheduled internet block failed: {}", err_msg),
-            },
-            attempt_count: 0,
-            last_error: None,
-        });
-
-        self.log_event("save:scheduled_block_failed");
-        let _ = self.commit_post_side_effect_candidate(candidate.clone());
-
-        self.schedule_next_internet_retry(attempt);
     }
 
     fn execute_scheduled_shutdown_deadline(&mut self, timer_id: TimerId) {
@@ -1948,80 +2162,111 @@ where
         }
 
         let mut candidate = self.state.clone();
-        if let Some(action) = candidate
+        let act = match candidate
             .active_actions
             .iter_mut()
             .find(|a| a.id == timer_id)
         {
-            if let Some(next_state) = runtime_deadline_transition(&action.execution_state, 0) {
-                action.execution_state = next_state;
+            Some(a) => a,
+            None => return,
+        };
 
-                self.log_event("save:scheduled_shutdown_executing");
-                if let Err(e) = self.commit_authoritative_state(candidate) {
-                    self.mark_persistence_failure(&e);
-                    return;
-                }
+        let executing_state = match runtime_deadline_transition(&act.execution_state, 0) {
+            Some(s @ ActionExecutionState::Executing) => s,
+            _ => return,
+        };
 
-                // Section 4: Only after durable transition succeeds may the volatile anchor be retired
-                self.monotonic_timers.remove(&timer_id);
+        act.execution_state = executing_state;
 
-                #[cfg(test)]
-                if let Some(ref hook) = self.pre_effect_hook {
-                    hook();
-                }
+        self.log_event("save:scheduled_shutdown_executing");
+        if self.commit_authoritative_state(candidate).is_err() {
+            return;
+        }
 
-                let shutdown_res = {
-                    let _gate = self.platform_effect_gate.lock().unwrap();
-                    if self.is_stop_requested() {
-                        return;
+        self.monotonic_timers.remove(&timer_id);
+
+        let _ = self.emit_event(Event::TimerExpired {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+        });
+
+        #[cfg(test)]
+        if let Some(ref hook) = self.pre_effect_hook {
+            hook();
+        }
+
+        let power_res = {
+            let _gate = self.platform_effect_gate.lock().unwrap();
+            if self.is_stop_requested() {
+                return;
+            }
+            self.log_event("power:initiate_shutdown");
+            self.power.initiate_shutdown()
+        };
+
+        let mut post_candidate = self.state.clone();
+        if let Some(act) = post_candidate
+            .active_actions
+            .iter_mut()
+            .find(|a| a.id == timer_id)
+        {
+            match power_res {
+                Ok(()) => {
+                    self.mutate_health_and_maybe_emit(|s| {
+                        s.power_error = None;
+                    });
+
+                    let prev_shutdown = self.shutdown_state;
+                    self.shutdown_state = ShutdownState::InProgress;
+                    self.maybe_emit_shutdown_state_changed(
+                        prev_shutdown,
+                        ShutdownState::InProgress,
+                    );
+
+                    if let Some(ActionExecutionState::Completed) =
+                        execution_success_transition(&act.execution_state)
+                    {
+                        post_candidate.active_actions.retain(|a| a.id != timer_id);
                     }
-                    self.log_event("power:initiate_shutdown");
-                    self.power.initiate_shutdown()
-                };
 
-                let mut post_candidate = self.state.clone();
-                if let Some(act) = post_candidate
-                    .active_actions
-                    .iter_mut()
-                    .find(|a| a.id == timer_id)
-                {
-                    match shutdown_res {
-                        Ok(()) => {
-                            self.power_error = None;
-                            self.shutdown_state = ShutdownState::InProgress;
-                            if let Some(ActionExecutionState::Completed) =
-                                execution_success_transition(&act.execution_state)
-                            {
-                                post_candidate.active_actions.retain(|a| a.id != timer_id);
-                                self.log_event("save:scheduled_shutdown_completed");
-                                let _ = self.commit_post_side_effect_candidate(post_candidate);
-                            }
-                        }
-                        Err(err) => {
-                            // Do NOT set InProgress
-                            self.power_error = Some(err.reason.clone());
-                            self.recompute_health_status();
+                    self.log_event("save:scheduled_shutdown_completed");
+                    let _ = self.commit_post_side_effect_candidate(post_candidate);
+                }
+                Err(err) => {
+                    self.mutate_health_and_maybe_emit(|s| {
+                        s.power_error = Some(err.reason.clone());
+                    });
 
-                            if let Some(next) = execution_failure_transition(
-                                &act.execution_state,
-                                err.reason.clone(),
-                            ) {
-                                act.execution_state = next;
-                            }
+                    if let Some(next) =
+                        execution_failure_transition(&act.execution_state, err.reason.clone())
+                    {
+                        act.execution_state = next;
+                    }
 
-                            let entry_id = self.id_source.next_outbox_id();
-                            post_candidate.telegram_outbox.push(TelegramOutboxEntry {
-                                entry_id,
-                                payload: TelegramPayload::ServiceNotification {
-                                    text: format!("Scheduled shutdown failed: {}", err.reason),
-                                },
-                                attempt_count: 0,
-                                last_error: None,
-                            });
+                    let entry_id = self.id_source.next_outbox_id();
+                    post_candidate.telegram_outbox.push(TelegramOutboxEntry {
+                        entry_id,
+                        payload: TelegramPayload::ServiceNotification {
+                            text: format!("Scheduled shutdown failed: {}", err.reason),
+                        },
+                        attempt_count: 0,
+                        last_error: None,
+                    });
 
-                            self.log_event("save:scheduled_shutdown_failed");
-                            let _ = self.commit_post_side_effect_candidate(post_candidate);
-                        }
+                    let previous_shutdown_state = self.shutdown_state;
+                    let target_shutdown_state =
+                        derive_shutdown_state(self.shutdown_state, &post_candidate.active_actions);
+
+                    // Synchronize local aggregate state BEFORE commit_post_side_effect_candidate can fail
+                    self.shutdown_state = target_shutdown_state;
+
+                    self.log_event("save:scheduled_shutdown_failed");
+                    let save_res = self.commit_post_side_effect_candidate(post_candidate);
+                    if save_res.is_ok() {
+                        self.maybe_emit_shutdown_state_changed(
+                            previous_shutdown_state,
+                            target_shutdown_state,
+                        );
                     }
                 }
             }
@@ -2029,6 +2274,9 @@ where
     }
 
     fn process_internet_reconciliation_retry(&mut self) {
+        let prev_desired = self.state.desired_internet_state;
+        let prev_observed = self.observed_internet_state;
+
         #[cfg(test)]
         if let Some(ref hook) = self.pre_effect_hook {
             hook();
@@ -2060,6 +2308,12 @@ where
             self.observed_internet_state = InternetState::Unknown;
         }
 
+        self.maybe_emit_internet_policy_changed(
+            prev_desired,
+            prev_observed,
+            StateChangeReason::PlatformSync,
+        );
+
         let desired_matches = match (self.state.desired_internet_state, &current_res) {
             (DesiredInternetState::Blocked, Ok(InternetState::Blocked)) => true,
             (DesiredInternetState::Unrestricted, Ok(InternetState::Unrestricted)) => true,
@@ -2084,9 +2338,9 @@ where
                     });
                 }
 
+                self.mark_gate_success();
                 self.log_event("save:retry_success");
                 let _ = self.commit_post_side_effect_candidate(candidate);
-                self.mark_gate_success();
             }
             (Ok(()), Ok(obs)) => {
                 // Verification mismatch is failure! (Section 8)
@@ -9394,5 +9648,2605 @@ mod tests {
 
         let res = handle.publish_parent_message(parent_msg);
         assert!(matches!(res, Err(ServiceRuntimeError::Stopping)));
+    }
+
+    // ========================================================================
+    // SLICE 3D: RUNTIME EVENT EMISSION COMPLETION TESTS (54 tests)
+    // ========================================================================
+
+    fn create_test_coordinator_custom(
+        bootstrapped: BootstrappedServiceState,
+        store: FakeStateStore,
+        gate: FakeInternetGate,
+        power: FakePowerController,
+        clock: FakeClock,
+        id_source: FakeIdSource,
+        retry: TestRetryPolicy,
+        log: Option<Arc<Mutex<Vec<String>>>>,
+    ) -> Result<
+        (
+            ServiceRuntimeCoordinator<
+                FakeStateStore,
+                FakeInternetGate,
+                FakePowerController,
+                FakeClock,
+                FakeIdSource,
+                TestRetryPolicy,
+            >,
+            StartupReadiness,
+        ),
+        ServiceRuntimeError,
+    > {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let platform_effect_gate = Arc::new(Mutex::new(()));
+        ServiceRuntimeCoordinator::new(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            log,
+            stop_requested,
+            platform_effect_gate,
+            None,
+        )
+    }
+
+    fn subscribe_to_coordinator(
+        coordinator: &mut ServiceRuntimeCoordinator<
+            FakeStateStore,
+            FakeInternetGate,
+            FakePowerController,
+            FakeClock,
+            FakeIdSource,
+            TestRetryPolicy,
+        >,
+    ) -> EventSubscription {
+        let (tx, rx) = channel();
+        coordinator.handle_subscribe_events(tx);
+        rx.recv().unwrap().unwrap()
+    }
+
+    fn query_coordinator_status(
+        coordinator: &ServiceRuntimeCoordinator<
+            FakeStateStore,
+            FakeInternetGate,
+            FakePowerController,
+            FakeClock,
+            FakeIdSource,
+            TestRetryPolicy,
+        >,
+    ) -> StatusSnapshot {
+        let (tx, rx) = channel();
+        coordinator.handle_query_status(tx);
+        rx.recv().unwrap()
+    }
+
+    // 1. Schedule Internet emits TimerScheduled after durable save
+    #[test]
+    fn test_schedule_internet_emits_timer_scheduled_after_durable_save() {
+        let (mut runtime, _clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(700, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        let ev = sub.receiver.try_recv().expect("TimerScheduled event");
+        match ev {
+            Event::TimerScheduled { action } => {
+                assert_eq!(action.id, timer_id);
+                assert_eq!(action.action_kind, ActionKind::BlockInternet);
+                assert_eq!(action.created_by, Initiator::ParentLocalPin);
+                assert_eq!(action.execution_state, ActionExecutionState::Pending);
+            }
+            other => panic!("Expected TimerScheduled, got {:?}", other),
+        }
+
+        let logs = log.lock().unwrap().clone();
+        let _save_idx = logs
+            .iter()
+            .position(|l| l.contains("save:"))
+            .expect("must save");
+        let _ = runtime.stop();
+    }
+
+    // 2. Schedule Shutdown emits TimerScheduled and ShutdownStateChanged
+    #[test]
+    fn test_schedule_shutdown_emits_timer_scheduled_and_shutdown_state_changed() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_shutdown(700, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        let ev1 = sub.receiver.try_recv().expect("first event");
+        match ev1 {
+            Event::TimerScheduled { action } => {
+                assert_eq!(action.id, timer_id);
+                assert_eq!(action.action_kind, ActionKind::ShutdownComputer);
+            }
+            other => panic!("Expected TimerScheduled, got {:?}", other),
+        }
+
+        let ev2 = sub.receiver.try_recv().expect("second event");
+        match ev2 {
+            Event::ShutdownStateChanged { previous, current } => {
+                assert_eq!(previous, ShutdownState::Idle);
+                assert_eq!(current, ShutdownState::Scheduled);
+            }
+            other => panic!("Expected ShutdownStateChanged, got {:?}", other),
+        }
+        let _ = runtime.stop();
+    }
+
+    // 3. Schedule action persistence failure emits no TimerScheduled
+    #[test]
+    fn test_schedule_action_persistence_failure_emits_no_timer_scheduled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        store.fail_saves.store(true, Ordering::SeqCst);
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator creation ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        let res = coordinator.handle_schedule_action(
+            ActionKind::BlockInternet,
+            700,
+            Initiator::ParentLocalPin,
+        );
+        assert!(res.is_err());
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(
+                ev,
+                Event::TimerScheduled { .. } | Event::WarningThresholdReached { .. }
+            ) {
+                panic!("No schedule event should be emitted on save failure");
+            }
+        }
+    }
+
+    // 4. Schedule action subscriber full does not fail schedule
+    #[test]
+    fn test_schedule_action_subscriber_full_does_not_fail_schedule() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        if let Some(tx) = coordinator.subscribers.get(&sub.subscription_id) {
+            for _ in 0..64 {
+                let _ = tx.try_send(Event::ServiceHealthUpdated {
+                    health: coordinator.build_service_health_snapshot(),
+                });
+            }
+        }
+
+        let res = coordinator.handle_schedule_action(
+            ActionKind::BlockInternet,
+            700,
+            Initiator::ParentLocalPin,
+        );
+        assert!(res.is_ok());
+        assert_eq!(coordinator.subscribers.len(), 0);
+    }
+
+    // 5. Schedule with creation due warning emits WarningThresholdReached
+    #[test]
+    fn test_schedule_with_creation_due_warning_emits_warning_threshold_reached() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(180, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        let ev1 = sub.receiver.try_recv().expect("TimerScheduled");
+        assert!(matches!(ev1, Event::TimerScheduled { .. }));
+
+        let ev2 = sub.receiver.try_recv().expect("WarningThresholdReached");
+        match ev2 {
+            Event::WarningThresholdReached { event } => {
+                assert_eq!(event.timer_id, timer_id);
+                assert_eq!(event.threshold, WarningThreshold::M3);
+            }
+            other => panic!("Expected WarningThresholdReached, got {:?}", other),
+        }
+        let _ = runtime.stop();
+    }
+
+    // 6. Schedule with creation passed warning does not emit warning event
+    #[test]
+    fn test_schedule_with_creation_passed_warning_does_not_emit_warning_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(200, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        let ev1 = sub.receiver.try_recv().expect("TimerScheduled");
+        assert!(matches!(ev1, Event::TimerScheduled { .. }));
+
+        let mut warning_thresholds = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::WarningThresholdReached { event } = ev {
+                assert_eq!(event.timer_id, timer_id);
+                warning_thresholds.push(event.threshold);
+            }
+        }
+        assert!(
+            warning_thresholds.is_empty(),
+            "No creation due warning for 200s timer"
+        );
+        let _ = runtime.stop();
+    }
+
+    // 7. Runtime warning emitted after durable state save
+    #[test]
+    fn test_runtime_warning_emitted_after_durable_state_save() {
+        let (mut runtime, clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(200, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(30));
+        runtime.handle().tick().unwrap();
+
+        let mut received = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::WarningThresholdReached { event } = ev {
+                if event.timer_id == timer_id && event.threshold == WarningThreshold::M3 {
+                    received = true;
+                }
+            }
+        }
+        assert!(received);
+
+        let logs = log.lock().unwrap().clone();
+        assert!(logs.iter().any(|l| l.contains("save:runtime_warning")));
+        let _ = runtime.stop();
+    }
+
+    // 8. Runtime warning persistence failure emits no warning and does not advance cursor
+    #[test]
+    fn test_runtime_warning_persistence_failure_emits_no_warning_and_does_not_advance_cursor() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator creation ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 200, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        store.fail_saves.store(true, Ordering::SeqCst);
+
+        clock.advance(Duration::from_secs(30));
+        coordinator.process_clock_and_events();
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::WarningThresholdReached { .. }) {
+                panic!("No warning event must be emitted on save failure");
+            }
+        }
+
+        let anchor = coordinator.monotonic_timers.get(&timer_id).unwrap();
+        assert_eq!(anchor.last_evaluated_remaining_seconds, 200);
+    }
+
+    // 9. Runtime warning no duplicate events for already emitted threshold
+    #[test]
+    fn test_runtime_warning_no_duplicate_events_for_already_emitted_threshold() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(200, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(30));
+        runtime.handle().tick().unwrap();
+
+        let mut count_m3 = 0;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::WarningThresholdReached { event } = ev {
+                if event.timer_id == timer_id && event.threshold == WarningThreshold::M3 {
+                    count_m3 += 1;
+                }
+            }
+        }
+        assert_eq!(count_m3, 1);
+
+        clock.advance(Duration::from_secs(10));
+        runtime.handle().tick().unwrap();
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::WarningThresholdReached { event } = ev {
+                if event.timer_id == timer_id && event.threshold == WarningThreshold::M3 {
+                    panic!("Duplicate warning threshold reached event!");
+                }
+            }
+        }
+        let _ = runtime.stop();
+    }
+
+    // 10. Runtime warning multiple thresholds emitted in deterministic order
+    #[test]
+    fn test_runtime_warning_multiple_thresholds_emitted_in_deterministic_order() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let timer_id = handle
+            .schedule_internet_block(4000, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(2500));
+        runtime.handle().tick().unwrap();
+
+        let mut thresholds = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::WarningThresholdReached { event } = ev {
+                if event.timer_id == timer_id {
+                    thresholds.push(event.threshold);
+                }
+            }
+        }
+
+        assert_eq!(
+            thresholds,
+            vec![WarningThreshold::M60, WarningThreshold::M30]
+        );
+        let _ = runtime.stop();
+    }
+
+    // 11. Internet deadline emits TimerExpired before gate block
+    #[test]
+    fn test_internet_deadline_emits_timer_expired_before_gate_block() {
+        let (mut runtime, clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe");
+
+        let timer_id = handle
+            .schedule_internet_block(10, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        runtime.handle().tick().unwrap();
+
+        let mut timer_expired_seen = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerExpired { id, action_kind } = ev {
+                assert_eq!(id, timer_id);
+                assert_eq!(action_kind, ActionKind::BlockInternet);
+                timer_expired_seen = true;
+            }
+        }
+        assert!(timer_expired_seen);
+
+        let logs = log.lock().unwrap();
+        assert!(logs.contains(&"gate:block_internet".to_string()));
+        let _ = runtime.stop();
+    }
+
+    // 12. Shutdown deadline emits TimerExpired before power initiate
+    #[test]
+    fn test_shutdown_deadline_emits_timer_expired_before_power_initiate() {
+        let (mut runtime, clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe");
+
+        let timer_id = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        runtime.handle().tick().unwrap();
+
+        let mut timer_expired_seen = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerExpired { id, action_kind } = ev {
+                assert_eq!(id, timer_id);
+                assert_eq!(action_kind, ActionKind::ShutdownComputer);
+                timer_expired_seen = true;
+            }
+        }
+        assert!(timer_expired_seen);
+
+        let logs = log.lock().unwrap();
+        assert!(logs.contains(&"power:initiate_shutdown".to_string()));
+        let _ = runtime.stop();
+    }
+
+    // 13. Deadline Executing persistence failure emits no TimerExpired
+    #[test]
+    fn test_deadline_executing_persistence_failure_emits_no_timer_expired() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator creation ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let _timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 10, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        store.fail_saves.store(true, Ordering::SeqCst);
+
+        clock.advance(Duration::from_secs(15));
+        coordinator.process_clock_and_events();
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::TimerExpired { .. }) {
+                panic!("TimerExpired must not be emitted on Executing save failure");
+            }
+        }
+    }
+
+    // 14. Deadline event delivery failure does not suppress side effect
+    #[test]
+    fn test_deadline_event_delivery_failure_does_not_suppress_side_effect() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator creation ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let _timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 10, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        drop(sub.receiver);
+
+        clock.advance(Duration::from_secs(15));
+        coordinator.process_clock_and_events();
+
+        let logs = log.lock().unwrap();
+        assert!(logs.contains(&"gate:block_internet".to_string()));
+    }
+
+    // 15. Startup recovery does not emit retroactive TimerExpired
+    #[test]
+    fn test_startup_recovery_does_not_emit_retroactive_timer_expired() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: TimerId([0x11; 16]),
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator creation ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.process_clock_and_events();
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(
+                ev,
+                Event::TimerExpired { .. } | Event::WarningThresholdReached { .. }
+            ) {
+                panic!(
+                    "No retroactive TimerExpired or Warning event during/after startup recovery"
+                );
+            }
+        }
+    }
+
+    // 16. Startup recovery pending shutdown missed emits MissedDeadlineOccurred
+    #[test]
+    fn test_startup_recovery_pending_shutdown_missed_emits_missed_deadline_occurred() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer_id = TimerId([0x22; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        let missed_event = logs
+            .iter()
+            .find(|l| l.contains("event:MissedDeadlineOccurred"))
+            .expect("Must emit MissedDeadlineOccurred");
+        assert!(missed_event.contains("Scheduled shutdown was missed while service was offline"));
+    }
+
+    // 17. Startup recovery executing shutdown missed emits MissedDeadlineOccurred
+    #[test]
+    fn test_startup_recovery_executing_shutdown_missed_emits_missed_deadline_occurred() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer_id = TimerId([0x23; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Executing,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("event:MissedDeadlineOccurred"))
+        );
+    }
+
+    // 18. Startup recovery failed shutdown missed emits MissedDeadlineOccurred
+    #[test]
+    fn test_startup_recovery_failed_shutdown_missed_emits_missed_deadline_occurred() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer_id = TimerId([0x24; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Failed {
+                reason: "prior failure".to_string(),
+            },
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("event:MissedDeadlineOccurred"))
+        );
+    }
+
+    // 19. Startup recovery missed deadline preserves action snapshot and safe reason
+    #[test]
+    fn test_startup_recovery_missed_deadline_preserves_action_snapshot_and_safe_reason() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer_id = TimerId([0x25; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        let missed_event = logs
+            .iter()
+            .find(|l| l.contains("event:MissedDeadlineOccurred"))
+            .expect("Must emit MissedDeadlineOccurred");
+        assert!(missed_event.contains("Scheduled shutdown was missed while service was offline"));
+        assert!(missed_event.contains("ShutdownComputer"));
+        assert!(missed_event.contains("Missed"));
+    }
+
+    // 20. Startup recovery multiple missed shutdowns emitted in deterministic order
+    #[test]
+    fn test_startup_recovery_multiple_missed_shutdowns_emitted_in_deterministic_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer1 = TimerId([0x26; 16]);
+        let timer2 = TimerId([0x27; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer1,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer2,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(600_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentTelegram { user_id: 42 },
+            execution_state: ActionExecutionState::Executing,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        let missed_events: Vec<_> = logs
+            .iter()
+            .filter(|l| l.contains("event:MissedDeadlineOccurred"))
+            .collect();
+        assert_eq!(missed_events.len(), 2);
+    }
+
+    // 21. Startup recovery persistence failure emits no missed deadline event
+    #[test]
+    fn test_startup_recovery_persistence_failure_emits_no_missed_deadline_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: TimerId([0x28; 16]),
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(500_000)),
+            created_at: UtcDateTime(400_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        store.fail_saves.store(true, Ordering::SeqCst);
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let res = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        );
+        assert!(res.is_err());
+    }
+
+    // 22. Shutdown aggregate startup future shutdown derives Scheduled
+    #[test]
+    fn test_shutdown_aggregate_startup_future_shutdown_derives_scheduled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: TimerId([0x29; 16]),
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2_000_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        assert_eq!(coordinator.shutdown_state, ShutdownState::Scheduled);
+        let snap = query_coordinator_status(&coordinator);
+        assert_eq!(snap.shutdown_state, ShutdownState::Scheduled);
+    }
+
+    // 23. Shutdown aggregate first schedule emits Idle to Scheduled
+    #[test]
+    fn test_shutdown_aggregate_first_schedule_emits_idle_to_scheduled() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let _ = handle
+            .schedule_shutdown(700, Initiator::ParentLocalPin)
+            .expect("schedule ok");
+
+        let _timer_ev = sub.receiver.try_recv().expect("TimerScheduled");
+        let state_ev = sub.receiver.try_recv().expect("ShutdownStateChanged");
+        match state_ev {
+            Event::ShutdownStateChanged { previous, current } => {
+                assert_eq!(previous, ShutdownState::Idle);
+                assert_eq!(current, ShutdownState::Scheduled);
+            }
+            other => panic!("Expected ShutdownStateChanged, got {:?}", other),
+        }
+        let _ = runtime.stop();
+    }
+
+    // 24. Shutdown aggregate second schedule emits no duplicate ShutdownStateChanged
+    #[test]
+    fn test_shutdown_aggregate_second_schedule_emits_no_duplicate_shutdown_state_changed() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let _ = handle
+            .schedule_shutdown(700, Initiator::ParentLocalPin)
+            .expect("first schedule");
+        while sub.receiver.try_recv().is_ok() {}
+
+        let _ = handle
+            .schedule_shutdown(1200, Initiator::ParentLocalPin)
+            .expect("second schedule");
+
+        let mut state_changed = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::ShutdownStateChanged { .. }) {
+                state_changed = true;
+            }
+        }
+        assert!(
+            !state_changed,
+            "Must not emit duplicate ShutdownStateChanged"
+        );
+        let _ = runtime.stop();
+    }
+
+    // 25. Shutdown aggregate cancel one when another remains stays Scheduled
+    #[test]
+    fn test_shutdown_aggregate_cancel_one_when_another_remains_stays_scheduled() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let id1 = handle
+            .schedule_shutdown(700, Initiator::ParentLocalPin)
+            .expect("sched 1");
+        let _id2 = handle
+            .schedule_shutdown(1200, Initiator::ParentLocalPin)
+            .expect("sched 2");
+        while sub.receiver.try_recv().is_ok() {}
+
+        let res = handle
+            .cancel_shutdown_timer(id1, Initiator::ParentLocalPin)
+            .expect("cancel ok");
+        assert_eq!(res, TimerCancellationResult::Cancelled);
+
+        let mut state_changed = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::ShutdownStateChanged { .. }) {
+                state_changed = true;
+            }
+        }
+        assert!(
+            !state_changed,
+            "Must stay Scheduled, no state changed event"
+        );
+        let snap = handle.query_status().expect("status ok");
+        assert_eq!(snap.shutdown_state, ShutdownState::Scheduled);
+        let _ = runtime.stop();
+    }
+
+    // 26. Shutdown aggregate cancel last emits Scheduled to Idle
+    #[test]
+    fn test_shutdown_aggregate_cancel_last_emits_scheduled_to_idle() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let id1 = handle
+            .schedule_shutdown(700, Initiator::ParentLocalPin)
+            .expect("sched 1");
+        while sub.receiver.try_recv().is_ok() {}
+
+        let res = handle
+            .cancel_shutdown_timer(id1, Initiator::ParentLocalPin)
+            .expect("cancel ok");
+        assert_eq!(res, TimerCancellationResult::Cancelled);
+
+        let ev1 = sub.receiver.try_recv().expect("TimerCancelled");
+        assert!(matches!(ev1, Event::TimerCancelled { .. }));
+
+        let ev2 = sub.receiver.try_recv().expect("ShutdownStateChanged");
+        match ev2 {
+            Event::ShutdownStateChanged { previous, current } => {
+                assert_eq!(previous, ShutdownState::Scheduled);
+                assert_eq!(current, ShutdownState::Idle);
+            }
+            other => panic!("Expected ShutdownStateChanged, got {:?}", other),
+        }
+        let snap = handle.query_status().expect("status ok");
+        assert_eq!(snap.shutdown_state, ShutdownState::Idle);
+        let _ = runtime.stop();
+    }
+
+    // 27. Shutdown aggregate deadline Pending to Executing emits no aggregate event
+    #[test]
+    fn test_shutdown_aggregate_deadline_pending_to_executing_emits_no_aggregate_event() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let _ = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("sched");
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        runtime.handle().tick().unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TimerExpired { .. }))
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::ShutdownStateChanged {
+                previous: ShutdownState::Scheduled,
+                current: ShutdownState::Scheduled
+            }
+        )));
+        let _ = runtime.stop();
+    }
+
+    // 28. Shutdown aggregate power success emits Scheduled to InProgress
+    #[test]
+    fn test_shutdown_aggregate_power_success_emits_scheduled_to_inprogress() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        let _ = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("sched");
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        runtime.handle().tick().unwrap();
+
+        let mut state_changed = None;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::ShutdownStateChanged { previous, current } = ev {
+                state_changed = Some((previous, current));
+            }
+        }
+        assert_eq!(
+            state_changed,
+            Some((ShutdownState::Scheduled, ShutdownState::InProgress))
+        );
+        let snap = handle.query_status().expect("status ok");
+        assert_eq!(snap.shutdown_state, ShutdownState::InProgress);
+        let _ = runtime.stop();
+    }
+
+    // 29. Shutdown aggregate completed removal preserves InProgress sticky
+    #[test]
+    fn test_shutdown_aggregate_completed_removal_preserves_inprogress_sticky() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let _ = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("sched");
+
+        clock.advance(Duration::from_secs(15));
+        runtime.handle().tick().unwrap();
+
+        let snap = handle.query_status().expect("status ok");
+        assert_eq!(snap.shutdown_state, ShutdownState::InProgress);
+        assert_eq!(snap.active_actions.len(), 0);
+
+        clock.advance(Duration::from_secs(10));
+        runtime.handle().tick().unwrap();
+
+        let snap2 = handle.query_status().expect("status ok");
+        assert_eq!(snap2.shutdown_state, ShutdownState::InProgress);
+        let _ = runtime.stop();
+    }
+
+    // 30. Shutdown aggregate power failure emits Scheduled to Idle only after persistence
+    #[test]
+    fn test_shutdown_aggregate_power_failure_emits_scheduled_to_idle_only_after_persistence() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        power.fail_shutdown.store(true, Ordering::SeqCst);
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let _ = coordinator
+            .handle_schedule_action(ActionKind::ShutdownComputer, 10, Initiator::ParentLocalPin)
+            .expect("sched");
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        coordinator.process_clock_and_events();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TimerExpired { .. }))
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ShutdownStateChanged {
+                previous: ShutdownState::Scheduled,
+                current: ShutdownState::Idle
+            }
+        )));
+        assert_eq!(coordinator.shutdown_state, ShutdownState::Idle);
+    }
+
+    // 31. Shutdown aggregate power failure with other pending shutdown stays Scheduled
+    #[test]
+    fn test_shutdown_aggregate_power_failure_with_other_pending_shutdown_stays_scheduled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        power.fail_shutdown.store(true, Ordering::SeqCst);
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let _ = coordinator
+            .handle_schedule_action(ActionKind::ShutdownComputer, 10, Initiator::ParentLocalPin)
+            .expect("sched 1");
+        let _ = coordinator
+            .handle_schedule_action(ActionKind::ShutdownComputer, 100, Initiator::ParentLocalPin)
+            .expect("sched 2");
+        while sub.receiver.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(15));
+        coordinator.process_clock_and_events();
+
+        let mut state_changed = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::ShutdownStateChanged { .. }) {
+                state_changed = true;
+            }
+        }
+        assert!(!state_changed, "Must stay Scheduled, no state event");
+        assert_eq!(coordinator.shutdown_state, ShutdownState::Scheduled);
+    }
+
+    // 32. Internet policy immediate block emits InternetPolicyChanged with ImmediateCommand reason
+    #[test]
+    fn test_internet_policy_immediate_block_emits_internet_policy_changed_with_immediate_command_reason()
+     {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        handle
+            .immediate_internet_block(Initiator::ParentLocalPin)
+            .expect("block ok");
+
+        let ev = sub.receiver.try_recv().expect("InternetPolicyChanged");
+        match ev {
+            Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } => {
+                assert_eq!(desired, DesiredInternetState::Blocked);
+                assert_eq!(observed, InternetState::Blocked);
+                assert_eq!(
+                    reason,
+                    StateChangeReason::ImmediateCommand {
+                        initiator: Initiator::ParentLocalPin
+                    }
+                );
+            }
+            other => panic!("Expected InternetPolicyChanged, got {:?}", other),
+        }
+        let _ = runtime.stop();
+    }
+
+    // 33. Internet policy immediate block platform failure emits mismatch event
+    #[test]
+    fn test_internet_policy_immediate_block_platform_failure_emits_mismatch_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        gate.fail_calls.store(true, Ordering::SeqCst);
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let res = coordinator.handle_immediate_block(Initiator::ParentLocalPin);
+        assert!(res.is_err());
+
+        let ev = sub
+            .receiver
+            .try_recv()
+            .expect("InternetPolicyChanged mismatch event");
+        match ev {
+            Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } => {
+                assert_eq!(desired, DesiredInternetState::Blocked);
+                assert_eq!(observed, InternetState::Unknown);
+                assert_eq!(
+                    reason,
+                    StateChangeReason::ImmediateCommand {
+                        initiator: Initiator::ParentLocalPin
+                    }
+                );
+            }
+            other => panic!("Expected InternetPolicyChanged, got {:?}", other),
+        }
+    }
+
+    // 34. Internet policy manual restore emits InternetPolicyChanged with ManualRestore reason
+    #[test]
+    fn test_internet_policy_manual_restore_emits_internet_policy_changed_with_manual_restore_reason()
+     {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        handle
+            .immediate_internet_block(Initiator::ParentLocalPin)
+            .expect("block ok");
+
+        let sub = handle.subscribe_events().expect("subscribe ok");
+        handle
+            .restore_internet(Initiator::ParentLocalPin)
+            .expect("restore ok");
+
+        let ev = sub.receiver.try_recv().expect("InternetPolicyChanged");
+        match ev {
+            Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } => {
+                assert_eq!(desired, DesiredInternetState::Unrestricted);
+                assert_eq!(observed, InternetState::Unrestricted);
+                assert_eq!(
+                    reason,
+                    StateChangeReason::ManualRestore {
+                        initiator: Initiator::ParentLocalPin
+                    }
+                );
+            }
+            other => panic!("Expected InternetPolicyChanged, got {:?}", other),
+        }
+        let _ = runtime.stop();
+    }
+
+    // 35. Internet policy manual restore platform failure emits mismatch event
+    #[test]
+    fn test_internet_policy_manual_restore_platform_failure_emits_mismatch_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        gate.fail_calls.store(true, Ordering::SeqCst);
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let res = coordinator.handle_restore_internet(Initiator::ParentLocalPin);
+        assert!(res.is_err());
+
+        let ev = sub.receiver.try_recv().expect("mismatch event");
+        match ev {
+            Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } => {
+                assert_eq!(desired, DesiredInternetState::Unrestricted);
+                assert_eq!(observed, InternetState::Unknown);
+                assert_eq!(
+                    reason,
+                    StateChangeReason::ManualRestore {
+                        initiator: Initiator::ParentLocalPin
+                    }
+                );
+            }
+            other => panic!("Expected InternetPolicyChanged, got {:?}", other),
+        }
+    }
+
+    // 36. Internet policy scheduled block emits InternetPolicyChanged with TimerExpired reason
+    #[test]
+    fn test_internet_policy_scheduled_block_emits_internet_policy_changed_with_timer_expired_reason()
+     {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let timer_id = TimerId([36; 16]);
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Unrestricted;
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(1_300_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate.clone(),
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        // Establish pre-deadline state: desired is Unrestricted, observed is Blocked
+        coordinator.observed_internet_state = InternetState::Blocked;
+        *gate.current.lock().unwrap() = InternetState::Blocked;
+
+        // Explicit pre-deadline assertions: desired is Unrestricted, observed is Blocked
+        assert_eq!(
+            coordinator.state.desired_internet_state,
+            DesiredInternetState::Unrestricted
+        );
+        assert_eq!(coordinator.observed_internet_state, InternetState::Blocked);
+        let pre_act = coordinator
+            .state
+            .active_actions
+            .iter()
+            .find(|a| a.id == timer_id)
+            .expect("target action present before deadline");
+        assert_eq!(pre_act.action_kind, ActionKind::BlockInternet);
+        assert_eq!(pre_act.execution_state, ActionExecutionState::Pending);
+
+        let now_mono = clock.monotonic_now();
+        coordinator.monotonic_timers.insert(
+            timer_id,
+            MonotonicTimerAnchor {
+                timer_id,
+                action_kind: ActionKind::BlockInternet,
+                utc_deadline: Deadline(UtcDateTime(1_300_000)),
+                monotonic_target: now_mono,
+                original_duration_seconds: 300,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 300,
+            },
+        );
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        while sub.receiver.try_recv().is_ok() {}
+
+        // Execute the exact scheduled BlockInternet deadline
+        coordinator.execute_scheduled_internet_deadline(timer_id);
+
+        let mut policy_events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } = ev
+            {
+                policy_events.push((desired, observed, reason));
+            }
+        }
+
+        // Event assertions: exactly 1 event with matching payload
+        assert_eq!(
+            policy_events.len(),
+            1,
+            "Must emit exactly one InternetPolicyChanged for desired-only pair change"
+        );
+        assert_eq!(
+            policy_events[0],
+            (
+                DesiredInternetState::Blocked,
+                InternetState::Blocked,
+                StateChangeReason::TimerExpired { timer_id }
+            )
+        );
+
+        // Post-deadline state assertions: desired is Blocked, observed is Blocked
+        assert_eq!(
+            coordinator.state.desired_internet_state,
+            DesiredInternetState::Blocked
+        );
+        assert_eq!(coordinator.observed_internet_state, InternetState::Blocked);
+    }
+
+    // 37. Internet policy startup restoration emits event on initial state change
+    #[test]
+    fn test_internet_policy_startup_restoration_emits_event_on_initial_state_change() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (_coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let logs = log.lock().unwrap().clone();
+        let policy_event = logs
+            .iter()
+            .find(|l| l.contains("event:InternetPolicyChanged"))
+            .expect("Must emit InternetPolicyChanged");
+        assert!(policy_event.contains("StartupRestoration"));
+    }
+
+    // 38. Internet policy platform sync emits event on observed change
+    #[test]
+    fn test_internet_policy_platform_sync_emits_event_on_observed_change() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate.clone(),
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.observed_internet_state = InternetState::Unrestricted;
+        *gate.current.lock().unwrap() = InternetState::Blocked;
+
+        coordinator.process_internet_reconciliation_retry();
+
+        let mut sync_event = None;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } = ev
+            {
+                sync_event = Some((desired, observed, reason));
+            }
+        }
+
+        assert_eq!(
+            sync_event,
+            Some((
+                DesiredInternetState::Blocked,
+                InternetState::Blocked,
+                StateChangeReason::PlatformSync
+            ))
+        );
+    }
+
+    // 39. Internet policy no change emits no duplicate event
+    #[test]
+    fn test_internet_policy_no_change_emits_no_duplicate_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        handle
+            .restore_internet(Initiator::ParentLocalPin)
+            .expect("restore ok");
+
+        let mut policy_count = 0;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::InternetPolicyChanged { .. }) {
+                policy_count += 1;
+            }
+        }
+        assert_eq!(
+            policy_count, 0,
+            "No event when desired and observed were already unrestricted"
+        );
+        let _ = runtime.stop();
+    }
+
+    // 40. Health persistence failure emits ServiceHealthUpdated
+    #[test]
+    fn test_health_persistence_failure_emits_service_health_updated() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        let err = StateStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        coordinator.mark_persistence_failure(&err);
+
+        let ev = sub.receiver.try_recv().expect("ServiceHealthUpdated");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert!(!health.persistence_healthy);
+                assert_eq!(health.status, HealthStatus::Critical);
+                assert!(health.last_error.unwrap().contains("disk full"));
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 41. Health persistence recovery emits ServiceHealthUpdated
+    #[test]
+    fn test_health_persistence_recovery_emits_service_health_updated() {
+        let mut coordinator = setup_test_coordinator();
+        let err = StateStoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        coordinator.mark_persistence_failure(&err);
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.mark_persistence_success();
+
+        let ev = sub.receiver.try_recv().expect("ServiceHealthUpdated");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert!(health.persistence_healthy);
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 42. Health gate failure emits ServiceHealthUpdated
+    #[test]
+    fn test_health_gate_failure_emits_service_health_updated() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.mark_gate_failure("WFP timeout".to_string());
+
+        let ev = sub.receiver.try_recv().expect("ServiceHealthUpdated");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert!(!health.internet_gate_healthy);
+                assert_eq!(health.last_error, Some("WFP timeout".to_string()));
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 43. Health gate recovery emits ServiceHealthUpdated
+    #[test]
+    fn test_health_gate_recovery_emits_service_health_updated() {
+        let mut coordinator = setup_test_coordinator();
+        coordinator.mark_gate_failure("WFP timeout".to_string());
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.mark_gate_success();
+
+        let ev = sub.receiver.try_recv().expect("ServiceHealthUpdated");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert!(health.internet_gate_healthy);
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 44. Health uptime advance alone emits no health event
+    #[test]
+    fn test_health_uptime_advance_alone_emits_no_health_event() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().expect("subscribe ok");
+
+        clock.advance(Duration::from_secs(100));
+        runtime.handle().tick().unwrap();
+
+        let mut health_ev_seen = false;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::ServiceHealthUpdated { .. }) {
+                health_ev_seen = true;
+            }
+        }
+        assert!(
+            !health_ev_seen,
+            "Uptime advance alone must not emit health event"
+        );
+        let _ = runtime.stop();
+    }
+
+    // 45. Health emitted event contains fresh uptime seconds
+    #[test]
+    fn test_health_emitted_event_contains_fresh_uptime_seconds() {
+        let mut coordinator = setup_test_coordinator();
+        coordinator.clock.advance(Duration::from_secs(123));
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.mark_gate_failure("test error".to_string());
+
+        let ev = sub.receiver.try_recv().expect("ServiceHealthUpdated");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.uptime_seconds, 123);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 46. Health event delivery failure does not alter runtime operation result
+    #[test]
+    fn test_health_event_delivery_failure_does_not_alter_runtime_operation_result() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        drop(sub.receiver);
+
+        coordinator.mark_gate_failure("dropped sub test".to_string());
+        assert_eq!(coordinator.subscribers.len(), 0);
+        assert!(!coordinator.health.internet_gate_healthy);
+    }
+
+    // 47. Shutdown aggregate startup future executing shutdown derives Scheduled
+    #[test]
+    fn test_shutdown_aggregate_startup_future_executing_shutdown_derives_scheduled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: TimerId([0x30; 16]),
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2_000_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Executing,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        assert_eq!(coordinator.shutdown_state, ShutdownState::Scheduled);
+    }
+
+    // 48. Shutdown aggregate failed action alone derives Idle
+    #[test]
+    fn test_shutdown_aggregate_failed_action_alone_derives_idle() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: TimerId([0x31; 16]),
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2_000_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Failed {
+                reason: "err".to_string(),
+            },
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        assert_eq!(coordinator.shutdown_state, ShutdownState::Idle);
+    }
+
+    // 49. Shutdown power failure persistence failure keeps snapshot consistent and suppresses state event
+    #[test]
+    fn test_shutdown_power_failure_persistence_failure_keeps_snapshot_consistent_and_suppresses_state_event()
+     {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        power.fail_shutdown.store(true, Ordering::SeqCst);
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::ShutdownComputer, 10, Initiator::ParentLocalPin)
+            .expect("sched ok");
+        while sub.receiver.try_recv().is_ok() {}
+
+        // Power fails on deadline, and subsequent save of Failed candidate fails
+        // Save 1: Schedule (1)
+        // Save 2: Executing (2)
+        // Save 3: Failed outcome (fails) -> fail_after_n_saves = 2
+        store.fail_after_n_saves.store(2, Ordering::SeqCst);
+
+        clock.advance(Duration::from_secs(15));
+        coordinator.process_clock_and_events();
+
+        let snap = query_coordinator_status(&coordinator);
+        assert_eq!(snap.active_actions.len(), 1);
+        assert_eq!(snap.active_actions[0].id, timer_id);
+        assert!(matches!(
+            snap.active_actions[0].execution_state,
+            ActionExecutionState::Failed { .. }
+        ));
+        assert_eq!(snap.shutdown_state, ShutdownState::Idle);
+        assert!(!snap.health.persistence_healthy);
+        assert_eq!(snap.health.status, HealthStatus::Critical);
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::ShutdownStateChanged { .. }) {
+                panic!(
+                    "Must not emit ShutdownStateChanged for failed non-durable persistence transition"
+                );
+            }
+        }
+    }
+
+    // 50. Internet policy platform sync failure emits final observed pair
+    #[test]
+    fn test_internet_policy_platform_sync_failure_emits_final_observed_pair() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate.clone(),
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("coordinator ok");
+
+        gate.fail_calls.store(true, Ordering::SeqCst);
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.process_internet_reconciliation_retry();
+
+        let mut sync_event = None;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::InternetPolicyChanged {
+                desired,
+                observed,
+                reason,
+            } = ev
+            {
+                sync_event = Some((desired, observed, reason));
+            }
+        }
+
+        assert_eq!(
+            sync_event,
+            Some((
+                DesiredInternetState::Blocked,
+                InternetState::Unknown,
+                StateChangeReason::PlatformSync
+            ))
+        );
+    }
+
+    // 51. Health power error set and clear emit meaningful updates
+    #[test]
+    fn test_health_power_error_set_and_clear_emit_meaningful_updates() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.mutate_health_and_maybe_emit(|s| {
+            s.power_error = Some("Power err".to_string());
+        });
+
+        let ev1 = sub.receiver.try_recv().expect("power error health update");
+        match ev1 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.last_error, Some("Power err".to_string()));
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        coordinator.mutate_health_and_maybe_emit(|s| {
+            s.power_error = None;
+        });
+
+        let ev2 = sub
+            .receiver
+            .try_recv()
+            .expect("power error cleared health update");
+        match ev2 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 52. Health retry policy error set and clear emit meaningful updates
+    #[test]
+    fn test_health_retry_policy_error_set_and_clear_emit_meaningful_updates() {
+        let mut coordinator = setup_test_coordinator();
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.mutate_health_and_maybe_emit(|s| {
+            s.retry_policy_error = Some("Zero delay error".to_string());
+        });
+
+        let ev1 = sub
+            .receiver
+            .try_recv()
+            .expect("retry policy error health update");
+        match ev1 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.last_error, Some("Zero delay error".to_string()));
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        coordinator.mutate_health_and_maybe_emit(|s| {
+            s.retry_policy_error = None;
+        });
+
+        let ev2 = sub
+            .receiver
+            .try_recv()
+            .expect("retry policy error cleared health update");
+        match ev2 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+    }
+
+    // 53. Health subscriber count event semantics preserved
+    #[test]
+    fn test_health_subscriber_count_event_semantics_preserved() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub1 = handle.subscribe_events().expect("sub1 ok");
+        assert_eq!(sub1.initial_snapshot.health.active_tray_sessions, 1);
+
+        let sub2 = handle.subscribe_events().expect("sub2 ok");
+        assert_eq!(sub2.initial_snapshot.health.active_tray_sessions, 2);
+
+        let _ = sub1;
+        let _ = sub2;
+        let _ = runtime.stop();
+    }
+
+    // 54. Health pruning reconciliation does not recurse or storm
+    #[test]
+    fn test_health_pruning_reconciliation_does_not_recurse_or_storm() {
+        let mut coordinator = setup_test_coordinator();
+
+        let mut healthy_subs = Vec::new();
+        for i in 0..5 {
+            let (tx, rx) = channel();
+            coordinator.handle_subscribe_events(tx);
+            let sub = rx.recv().unwrap().unwrap();
+            if i < 3 {
+                drop(sub.receiver);
+            } else {
+                healthy_subs.push(sub);
+            }
+        }
+
+        coordinator.mutate_health_and_maybe_emit(|s| {
+            s.health.internet_gate_healthy = false;
+            s.internet_gate_error = Some("Gate err".to_string());
+        });
+
+        assert_eq!(coordinator.subscribers.len(), healthy_subs.len());
+        assert_eq!(
+            coordinator.health.active_tray_sessions,
+            healthy_subs.len() as u32
+        );
+    }
+
+    // 55. Internet deadline missing action stale anchor emits no timer expired and no gate call
+    #[test]
+    fn test_internet_deadline_missing_action_stale_anchor_emits_no_timer_expired_and_no_gate_call()
+    {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        // Insert a stale anchor for an absent timer
+        let stale_id = TimerId([99; 16]);
+        let now_mono = clock.monotonic_now();
+        coordinator.monotonic_timers.insert(
+            stale_id,
+            MonotonicTimerAnchor {
+                timer_id: stale_id,
+                action_kind: ActionKind::BlockInternet,
+                utc_deadline: Deadline(UtcDateTime(1_000_000)),
+                monotonic_target: now_mono,
+                original_duration_seconds: 10,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 10,
+            },
+        );
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.execute_scheduled_internet_deadline(stale_id);
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::TimerExpired { .. }) {
+                panic!("Must not emit TimerExpired for missing action");
+            }
+        }
+
+        let logs = log.lock().unwrap().clone();
+        assert!(
+            !logs.iter().any(|l| l.contains("gate:block_internet")),
+            "Must not call InternetGate for missing action"
+        );
+    }
+
+    // 56. Shutdown deadline failed action stale anchor emits no timer expired and no power call
+    #[test]
+    fn test_shutdown_deadline_failed_action_stale_anchor_emits_no_timer_expired_and_no_power_call()
+    {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        let timer_id = TimerId([7; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(1_500_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Failed {
+                reason: "Prior failure".to_string(),
+            },
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let now_mono = clock.monotonic_now();
+        coordinator.monotonic_timers.insert(
+            timer_id,
+            MonotonicTimerAnchor {
+                timer_id,
+                action_kind: ActionKind::ShutdownComputer,
+                utc_deadline: Deadline(UtcDateTime(1_500_000)),
+                monotonic_target: now_mono,
+                original_duration_seconds: 10,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 10,
+            },
+        );
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.execute_scheduled_shutdown_deadline(timer_id);
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if matches!(ev, Event::TimerExpired { .. }) {
+                panic!("Must not emit TimerExpired for Failed action");
+            }
+        }
+
+        let logs = log.lock().unwrap().clone();
+        assert!(
+            !logs.iter().any(|l| l.contains("power:initiate_shutdown")),
+            "Must not call PowerController for Failed action"
+        );
+
+        let act = coordinator
+            .state
+            .active_actions
+            .iter()
+            .find(|a| a.id == timer_id)
+            .expect("action present");
+        assert!(
+            matches!(act.execution_state, ActionExecutionState::Failed { .. }),
+            "Action execution state must remain Failed"
+        );
+    }
+
+    // 57. Immediate block event order policy then gate health then clear retry persistence
+    #[test]
+    fn test_immediate_block_event_order_policy_then_gate_health_then_clear_retry_persistence() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        coordinator.state.internet_retry = Some(InternetRetry {
+            attempt_count: 1,
+            last_error: Some("Prior gate error".to_string()),
+        });
+
+        // Make gate unhealthy initially
+        coordinator.mark_gate_failure("Prior gate error".to_string());
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator
+            .handle_immediate_block(Initiator::ParentLocalPin)
+            .expect("block ok");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        let policy_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::InternetPolicyChanged { .. }))
+            .expect("policy event emitted");
+        let health_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ServiceHealthUpdated { .. }))
+            .expect("health event emitted");
+        assert!(
+            policy_idx < health_idx,
+            "InternetPolicyChanged must precede ServiceHealthUpdated"
+        );
+
+        let logs = log.lock().unwrap().clone();
+        let gate_call_idx = logs
+            .iter()
+            .position(|l| l.contains("gate:block_internet"))
+            .expect("gate called");
+        let clear_retry_idx = logs
+            .iter()
+            .position(|l| l.contains("save:clear_retry"))
+            .expect("clear retry saved");
+        assert!(
+            gate_call_idx < clear_retry_idx,
+            "Clear retry save must follow gate operation"
+        );
+    }
+
+    // 58. Restore internet event order policy then gate health then clear retry persistence
+    #[test]
+    fn test_restore_internet_event_order_policy_then_gate_health_then_clear_retry_persistence() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        coordinator.state.internet_retry = Some(InternetRetry {
+            attempt_count: 1,
+            last_error: Some("Prior gate error".to_string()),
+        });
+
+        coordinator.mark_gate_failure("Prior gate error".to_string());
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator
+            .handle_restore_internet(Initiator::ParentLocalPin)
+            .expect("restore ok");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        let policy_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::InternetPolicyChanged { .. }))
+            .expect("policy event emitted");
+        let health_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ServiceHealthUpdated { .. }))
+            .expect("health event emitted");
+        assert!(
+            policy_idx < health_idx,
+            "InternetPolicyChanged must precede ServiceHealthUpdated"
+        );
+
+        let logs = log.lock().unwrap().clone();
+        let gate_call_idx = logs
+            .iter()
+            .position(|l| l.contains("gate:unblock_internet"))
+            .expect("gate called");
+        let clear_retry_idx = logs
+            .iter()
+            .position(|l| l.contains("save:clear_retry"))
+            .expect("clear retry saved");
+        assert!(
+            gate_call_idx < clear_retry_idx,
+            "Clear retry save must follow gate operation"
+        );
+    }
+
+    // 59. Scheduled internet success event order policy then gate health then completed persistence
+    #[test]
+    fn test_scheduled_internet_success_event_order_policy_then_gate_health_then_completed_persistence()
+     {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let timer_id = TimerId([101; 16]);
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(1_300_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        let now_mono = clock.monotonic_now();
+        coordinator.monotonic_timers.insert(
+            timer_id,
+            MonotonicTimerAnchor {
+                timer_id,
+                action_kind: ActionKind::BlockInternet,
+                utc_deadline: Deadline(UtcDateTime(1_300_000)),
+                monotonic_target: now_mono,
+                original_duration_seconds: 300,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 300,
+            },
+        );
+
+        coordinator.mark_gate_failure("Prior gate error".to_string());
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.execute_scheduled_internet_deadline(timer_id);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        let timer_expired_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::TimerExpired { .. }))
+            .expect("TimerExpired emitted");
+        let policy_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::InternetPolicyChanged { .. }))
+            .expect("InternetPolicyChanged emitted");
+        let health_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ServiceHealthUpdated { .. }))
+            .expect("ServiceHealthUpdated emitted");
+
+        assert!(
+            timer_expired_idx < policy_idx,
+            "TimerExpired must precede InternetPolicyChanged"
+        );
+        assert!(
+            policy_idx < health_idx,
+            "InternetPolicyChanged must precede ServiceHealthUpdated"
+        );
+
+        let logs = log.lock().unwrap().clone();
+        let completed_save_idx = logs
+            .iter()
+            .position(|l| l.contains("save:scheduled_internet_completed"))
+            .expect("completed save");
+        let gate_call_idx = logs
+            .iter()
+            .position(|l| l.contains("gate:block_internet"))
+            .expect("gate called");
+        assert!(
+            gate_call_idx < completed_save_idx,
+            "Completed save must follow gate call"
+        );
+
+        assert!(
+            !coordinator
+                .state
+                .active_actions
+                .iter()
+                .any(|a| a.id == timer_id),
+            "Completed action must be removed"
+        );
+    }
+
+    // 60. Scheduled internet failure event order policy then gate health then failed persistence
+    #[test]
+    fn test_scheduled_internet_failure_event_order_policy_then_gate_health_then_failed_persistence()
+    {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let timer_id = TimerId([102; 16]);
+        let mut initial_state = sample_initial_state();
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(1_300_000)),
+            created_at: UtcDateTime(1_000_000),
+            created_by: Initiator::ParentLocalPin,
+            execution_state: ActionExecutionState::Pending,
+            emitted_thresholds: std::collections::HashSet::new(),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate.clone(),
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        gate.fail_calls.store(true, Ordering::SeqCst);
+
+        let now_mono = clock.monotonic_now();
+        coordinator.monotonic_timers.insert(
+            timer_id,
+            MonotonicTimerAnchor {
+                timer_id,
+                action_kind: ActionKind::BlockInternet,
+                utc_deadline: Deadline(UtcDateTime(1_300_000)),
+                monotonic_target: now_mono,
+                original_duration_seconds: 300,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 300,
+            },
+        );
+
+        let sub = subscribe_to_coordinator(&mut coordinator);
+        coordinator.execute_scheduled_internet_deadline(timer_id);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        let timer_expired_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::TimerExpired { .. }))
+            .expect("TimerExpired emitted");
+        let policy_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::InternetPolicyChanged { .. }))
+            .expect("InternetPolicyChanged emitted");
+        let health_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ServiceHealthUpdated { .. }))
+            .expect("ServiceHealthUpdated emitted");
+
+        assert!(
+            timer_expired_idx < policy_idx,
+            "TimerExpired must precede InternetPolicyChanged"
+        );
+        assert!(
+            policy_idx < health_idx,
+            "InternetPolicyChanged must precede ServiceHealthUpdated"
+        );
+
+        let act = coordinator
+            .state
+            .active_actions
+            .iter()
+            .find(|a| a.id == timer_id)
+            .expect("action retained");
+        assert!(
+            matches!(act.execution_state, ActionExecutionState::Failed { .. }),
+            "Action state must be Failed"
+        );
+    }
+
+    // 61. Platform sync success event order policy then gate health then retry success persistence
+    #[test]
+    fn test_platform_sync_success_event_order_policy_then_gate_health_then_retry_success_persistence()
+     {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = sample_initial_state();
+        initial_state.desired_internet_state = DesiredInternetState::Blocked;
+        initial_state.internet_retry = Some(InternetRetry {
+            attempt_count: 1,
+            last_error: Some("Prior gate error".to_string()),
+        });
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Blocked, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let (mut coordinator, _) = create_test_coordinator_custom(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("coordinator ok");
+
+        // Set observed state to Unrestricted to induce a change on sync
+        coordinator.observed_internet_state = InternetState::Unrestricted;
+        coordinator.mark_gate_failure("Prior gate error".to_string());
+        let sub = subscribe_to_coordinator(&mut coordinator);
+
+        coordinator.process_internet_reconciliation_retry();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            events.push(ev);
+        }
+
+        let policy_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::InternetPolicyChanged { .. }))
+            .expect("InternetPolicyChanged emitted");
+        let health_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ServiceHealthUpdated { .. }))
+            .expect("ServiceHealthUpdated emitted");
+
+        assert!(
+            policy_idx < health_idx,
+            "InternetPolicyChanged must precede ServiceHealthUpdated"
+        );
+
+        let logs = log.lock().unwrap().clone();
+        let gate_call_idx = logs
+            .iter()
+            .position(|l| l.contains("gate:block_internet"))
+            .expect("gate called");
+        let retry_save_idx = logs
+            .iter()
+            .position(|l| l.contains("save:retry_success"))
+            .expect("retry success saved");
+        assert!(
+            gate_call_idx < retry_save_idx,
+            "Retry success save must follow gate call"
+        );
     }
 }
