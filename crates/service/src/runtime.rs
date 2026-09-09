@@ -17,9 +17,9 @@ use crate::persistence::{
 };
 use crate::state_store::{StateFileStore, StateStoreError};
 use palka_core::{
-    ActionExecutionState, ActionKind, Deadline, DesiredInternetState, HealthStatus, Initiator,
-    InternetState, ScheduledAction, ServiceHealth, ShutdownState, StatusSnapshot, TimerId,
-    UtcDateTime, WarningThreshold, action_state_is_terminal, creation_due_thresholds,
+    ActionExecutionState, ActionKind, Deadline, DesiredInternetState, Event, HealthStatus,
+    Initiator, InternetState, ScheduledAction, ServiceHealth, ShutdownState, StatusSnapshot,
+    TimerId, UtcDateTime, WarningThreshold, action_state_is_terminal, creation_due_thresholds,
     creation_passed_thresholds, crossed_warning_thresholds, execution_failure_transition,
     execution_success_transition, recovery_overdue_transition, recovery_passed_thresholds,
     runtime_deadline_transition, shutdown_cancel_allowed,
@@ -27,10 +27,24 @@ use palka_core::{
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, spawn};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Internal subscription identifier for runtime event subscribers.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SubscriptionId(pub(crate) u64);
+
+/// Active typed event subscription handle returned to internal consumers.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct EventSubscription {
+    pub(crate) subscription_id: SubscriptionId,
+    pub(crate) initial_snapshot: StatusSnapshot,
+    pub(crate) receiver: Receiver<Event>,
+}
 
 // ============================================================================
 // 1. ABSTRACT PORTS & TRAITS
@@ -266,6 +280,8 @@ pub enum ServiceRuntimeError {
     CancellationForbidden(String),
     InvalidInput(String),
     Stopping,
+    SubscriptionIdExhausted,
+    SubscriptionCapacityExhausted,
 }
 
 impl fmt::Display for ServiceRuntimeError {
@@ -282,6 +298,13 @@ impl fmt::Display for ServiceRuntimeError {
             Self::CancellationForbidden(msg) => write!(f, "Cancellation forbidden: {msg}"),
             Self::InvalidInput(msg) => write!(f, "Invalid runtime input: {msg}"),
             Self::Stopping => write!(f, "Service runtime is stopping: new requests rejected"),
+            Self::SubscriptionIdExhausted => write!(f, "Subscription ID allocation exhausted"),
+            Self::SubscriptionCapacityExhausted => {
+                write!(
+                    f,
+                    "Subscription capacity exhausted: active tray sessions cannot exceed u32::MAX"
+                )
+            }
         }
     }
 }
@@ -405,6 +428,13 @@ enum RuntimeCommand {
     QueryStatus {
         reply: Sender<StatusSnapshot>,
     },
+    SubscribeEvents {
+        reply: Sender<Result<EventSubscription, ServiceRuntimeError>>,
+    },
+    UnsubscribeEvents {
+        subscription_id: SubscriptionId,
+        reply: Sender<Result<bool, ServiceRuntimeError>>,
+    },
     #[cfg(test)]
     Tick {
         reply: Sender<()>,
@@ -433,6 +463,7 @@ struct ServiceRuntimeCoordinator<S, G, P, C, I, R> {
     monotonic_timers: HashMap<TimerId, MonotonicTimerAnchor>,
     next_retry_at: Option<Instant>,
     stopping: bool,
+    #[cfg(test)]
     call_log: Option<Arc<Mutex<Vec<String>>>>,
     monotonic_start: Instant,
     stop_requested: Arc<AtomicBool>,
@@ -444,6 +475,17 @@ struct ServiceRuntimeCoordinator<S, G, P, C, I, R> {
     internet_gate_error: Option<String>,
     power_error: Option<String>,
     retry_policy_error: Option<String>,
+    subscribers: HashMap<SubscriptionId, SyncSender<Event>>,
+    next_subscription_id: Option<u64>,
+}
+
+fn checked_prospective_active_session_count(
+    current_len: usize,
+) -> Result<u32, ServiceRuntimeError> {
+    let prospective_len = current_len
+        .checked_add(1)
+        .ok_or(ServiceRuntimeError::SubscriptionCapacityExhausted)?;
+    u32::try_from(prospective_len).map_err(|_| ServiceRuntimeError::SubscriptionCapacityExhausted)
 }
 
 impl<S, G, P, C, I, R> ServiceRuntimeCoordinator<S, G, P, C, I, R>
@@ -463,7 +505,7 @@ where
         clock: C,
         id_source: I,
         retry_policy: R,
-        call_log: Option<Arc<Mutex<Vec<String>>>>,
+        #[cfg(test)] call_log: Option<Arc<Mutex<Vec<String>>>>,
         stop_requested: Arc<AtomicBool>,
         platform_effect_gate: Arc<Mutex<()>>,
         #[cfg(test)] pre_effect_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -494,6 +536,7 @@ where
             monotonic_timers: HashMap::new(),
             next_retry_at: None,
             stopping: false,
+            #[cfg(test)]
             call_log,
             monotonic_start,
             stop_requested,
@@ -505,12 +548,15 @@ where
             internet_gate_error: None,
             power_error: None,
             retry_policy_error: None,
+            subscribers: HashMap::new(),
+            next_subscription_id: Some(1),
         };
 
         let readiness = coordinator.perform_startup_recovery()?;
         Ok((coordinator, readiness))
     }
 
+    #[cfg(test)]
     fn log_event(&self, event: &str) {
         if let Some(log) = &self.call_log {
             if let Ok(mut l) = log.lock() {
@@ -518,6 +564,10 @@ where
             }
         }
     }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn log_event(&self, _event: &str) {}
 
     fn recompute_health_status(&mut self) {
         if !self.health.persistence_healthy {
@@ -913,7 +963,7 @@ where
         }
     }
 
-    fn build_status_snapshot(&self) -> StatusSnapshot {
+    fn build_service_health_snapshot(&self) -> ServiceHealth {
         let uptime_seconds = self
             .clock
             .monotonic_now()
@@ -923,16 +973,147 @@ where
         let mut health = self.health.clone();
         health.uptime_seconds = uptime_seconds;
         health.telegram_connected = false;
+        health
+    }
 
+    fn build_status_snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
             desired_internet_state: self.state.desired_internet_state,
             observed_internet_state: self.observed_internet_state,
             shutdown_state: self.shutdown_state,
             active_actions: self.state.active_actions.clone(),
-            health,
+            health: self.build_service_health_snapshot(),
             target_child_sid: self.bootstrapped.config.child_sid.clone(),
             timestamp: self.clock.utc_now(),
         }
+    }
+
+    fn checked_active_session_count(&self) -> Result<u32, ServiceRuntimeError> {
+        u32::try_from(self.subscribers.len())
+            .map_err(|_| ServiceRuntimeError::SubscriptionCapacityExhausted)
+    }
+
+    fn try_send_to_subscribers(
+        &self,
+        event: &Event,
+        excluded_subscription: Option<SubscriptionId>,
+    ) -> Vec<SubscriptionId> {
+        let mut failed = Vec::new();
+        for (id, tx) in &self.subscribers {
+            if Some(*id) == excluded_subscription {
+                continue;
+            }
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    failed.push(*id);
+                }
+            }
+        }
+        failed
+    }
+
+    fn reconcile_subscriber_registry(
+        &mut self,
+        excluded_subscription: Option<SubscriptionId>,
+    ) -> Result<(), ServiceRuntimeError> {
+        loop {
+            let target_count = self.checked_active_session_count()?;
+            let count_changed = self.health.active_tray_sessions != target_count;
+            if !count_changed {
+                return Ok(());
+            }
+            self.health.active_tray_sessions = target_count;
+            let event = Event::ServiceHealthUpdated {
+                health: self.build_service_health_snapshot(),
+            };
+            let failed = self.try_send_to_subscribers(&event, excluded_subscription);
+            if failed.is_empty() {
+                return Ok(());
+            }
+            for id in failed {
+                self.subscribers.remove(&id);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn emit_event(&mut self, event: Event) -> Result<(), ServiceRuntimeError> {
+        let failed = self.try_send_to_subscribers(&event, None);
+        if !failed.is_empty() {
+            for id in failed {
+                self.subscribers.remove(&id);
+            }
+            self.reconcile_subscriber_registry(None)?;
+        }
+        Ok(())
+    }
+
+    fn handle_subscribe_events(
+        &mut self,
+        reply: Sender<Result<EventSubscription, ServiceRuntimeError>>,
+    ) {
+        // 1. Preflight: SubscriptionId
+        let candidate_id = match self.next_subscription_id {
+            Some(id) => id,
+            None => {
+                let _ = reply.send(Err(ServiceRuntimeError::SubscriptionIdExhausted));
+                return;
+            }
+        };
+        let subscription_id = SubscriptionId(candidate_id);
+        if self.subscribers.contains_key(&subscription_id) {
+            let _ = reply.send(Err(ServiceRuntimeError::SubscriptionIdExhausted));
+            return;
+        }
+
+        // 2. Preflight: Active session capacity
+        if let Err(e) = checked_prospective_active_session_count(self.subscribers.len()) {
+            let _ = reply.send(Err(e));
+            return;
+        }
+
+        // 3. Register channel and advance allocator
+        let (tx, rx) = sync_channel::<Event>(64);
+        self.subscribers.insert(subscription_id, tx);
+        self.next_subscription_id = candidate_id.checked_add(1);
+
+        // 4. Reconcile with exclusion of new subscription
+        if let Err(e) = self.reconcile_subscriber_registry(Some(subscription_id)) {
+            self.subscribers.remove(&subscription_id);
+            let _ = self.reconcile_subscriber_registry(None);
+            let _ = reply.send(Err(e));
+            return;
+        }
+
+        // 5. Build final snapshot (contains final stable count)
+        let initial_snapshot = self.build_status_snapshot();
+        let subscription = EventSubscription {
+            subscription_id,
+            initial_snapshot,
+            receiver: rx,
+        };
+
+        // 6. Send reply, handling disconnect rollback
+        if reply.send(Ok(subscription)).is_err() {
+            self.subscribers.remove(&subscription_id);
+            let _ = self.reconcile_subscriber_registry(None);
+        }
+    }
+
+    fn handle_unsubscribe_events(
+        &mut self,
+        subscription_id: SubscriptionId,
+        reply: Sender<Result<bool, ServiceRuntimeError>>,
+    ) {
+        let existed = self.subscribers.remove(&subscription_id).is_some();
+        if existed {
+            if let Err(e) = self.reconcile_subscriber_registry(None) {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        }
+        let _ = reply.send(Ok(existed));
     }
 
     /// Handles incoming messages and dispatches scheduled events.
@@ -968,6 +1149,12 @@ where
                     let _ = reply.send(Err(ServiceRuntimeError::Stopping));
                 }
                 RuntimeCommand::AckTelegram { reply, .. } => {
+                    let _ = reply.send(Err(ServiceRuntimeError::Stopping));
+                }
+                RuntimeCommand::SubscribeEvents { reply } => {
+                    let _ = reply.send(Err(ServiceRuntimeError::Stopping));
+                }
+                RuntimeCommand::UnsubscribeEvents { reply, .. } => {
                     let _ = reply.send(Err(ServiceRuntimeError::Stopping));
                 }
             }
@@ -1007,6 +1194,15 @@ where
             RuntimeCommand::QueryStatus { reply } => {
                 self.handle_query_status(reply);
             }
+            RuntimeCommand::SubscribeEvents { reply } => {
+                self.handle_subscribe_events(reply);
+            }
+            RuntimeCommand::UnsubscribeEvents {
+                subscription_id,
+                reply,
+            } => {
+                self.handle_unsubscribe_events(subscription_id, reply);
+            }
             #[cfg(test)]
             RuntimeCommand::Tick { reply } => {
                 self.process_clock_and_events();
@@ -1014,6 +1210,8 @@ where
             }
             RuntimeCommand::Stop { reply } => {
                 self.stopping = true;
+                self.subscribers.clear();
+                self.health.active_tray_sessions = 0;
                 let flush_res = if self.pending_durable_candidate.is_some() {
                     self.flush_pending_durable_candidate()
                         .map_err(TeardownError::Persistence)
@@ -2058,6 +2256,52 @@ impl RuntimeHandle {
             .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_events(&self) -> Result<EventSubscription, ServiceRuntimeError> {
+        let reply_rx = {
+            let guard = self.ingress.lock().unwrap();
+            if *guard {
+                return Err(ServiceRuntimeError::Stopping);
+            }
+            let (reply_tx, reply_rx) = channel();
+            self.command_tx
+                .send(RuntimeCommand::SubscribeEvents { reply: reply_tx })
+                .map_err(|e| {
+                    ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string()))
+                })?;
+            reply_rx
+        };
+        reply_rx
+            .recv()
+            .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unsubscribe_events(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Result<bool, ServiceRuntimeError> {
+        let reply_rx = {
+            let guard = self.ingress.lock().unwrap();
+            if *guard {
+                return Err(ServiceRuntimeError::Stopping);
+            }
+            let (reply_tx, reply_rx) = channel();
+            self.command_tx
+                .send(RuntimeCommand::UnsubscribeEvents {
+                    subscription_id,
+                    reply: reply_tx,
+                })
+                .map_err(|e| {
+                    ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string()))
+                })?;
+            reply_rx
+        };
+        reply_rx
+            .recv()
+            .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
+    }
+
     #[cfg(test)]
     pub(crate) fn tick(&self) -> Result<(), ServiceRuntimeError> {
         let reply_rx = {
@@ -2122,6 +2366,7 @@ impl ServiceRuntime {
             clock,
             id_source,
             retry_policy,
+            #[cfg(test)]
             None,
             #[cfg(test)]
             None,
@@ -2206,7 +2451,7 @@ impl ServiceRuntime {
         clock: C,
         id_source: I,
         retry_policy: R,
-        call_log: Option<Arc<Mutex<Vec<String>>>>,
+        #[cfg(test)] call_log: Option<Arc<Mutex<Vec<String>>>>,
         #[cfg(test)] pre_effect_hook: Option<Arc<dyn Fn() + Send + Sync>>,
         #[cfg(test)] stop_effect_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, ServiceRuntimeError>
@@ -2228,6 +2473,7 @@ impl ServiceRuntime {
             clock,
             id_source,
             retry_policy,
+            #[cfg(test)]
             call_log,
             stop_requested.clone(),
             platform_effect_gate.clone(),
@@ -6823,5 +7069,689 @@ mod tests {
             1,
             "No second platform attempt must start"
         );
+    }
+
+    // ========================================================================
+    // SLICE 3A TEST FIXTURES & 19 TESTS
+    // ========================================================================
+
+    fn sample_initial_state() -> PersistentState {
+        PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        }
+    }
+
+    fn setup_test_runtime() -> (ServiceRuntime, FakeClock, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        let runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock.clone(),
+            id_source,
+            retry,
+            Some(log.clone()),
+        )
+        .expect("Runtime construction must succeed");
+
+        (runtime, clock, log)
+    }
+
+    fn setup_test_coordinator() -> ServiceRuntimeCoordinator<
+        FakeStateStore,
+        FakeInternetGate,
+        FakePowerController,
+        FakeClock,
+        FakeIdSource,
+        TestRetryPolicy,
+    > {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1_000_000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(10));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let platform_effect_gate = Arc::new(Mutex::new(()));
+
+        let (coordinator, _) = ServiceRuntimeCoordinator::new(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+            stop_requested,
+            platform_effect_gate,
+            None,
+        )
+        .expect("Coordinator construction must succeed");
+
+        coordinator
+    }
+
+    #[test]
+    fn test_ipc37_typed_event_broadcaster_independent_of_call_log() {
+        let initial_state = sample_initial_state();
+        let store = FakeStateStore::new(initial_state.clone(), Arc::new(Mutex::new(Vec::new())));
+        let gate = FakeInternetGate::new(
+            InternetState::Unrestricted,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let power = FakePowerController::new(Arc::new(Mutex::new(Vec::new())));
+        let clock = FakeClock::new(1000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+
+        // Start runtime with call_log = None
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store,
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            None,
+        )
+        .expect("Runtime construction must succeed without call_log");
+
+        let handle = runtime.handle().clone();
+        let sub = handle
+            .subscribe_events()
+            .expect("Subscription must succeed with call_log=None");
+        assert_eq!(sub.subscription_id, SubscriptionId(1));
+        assert_eq!(sub.initial_snapshot.health.active_tray_sessions, 1);
+
+        let unsub_res = handle
+            .unsubscribe_events(sub.subscription_id)
+            .expect("Unsubscribe must succeed");
+        assert!(unsub_res);
+
+        let stop_res = runtime.stop();
+        assert!(stop_res.is_ok());
+    }
+
+    #[test]
+    fn test_ipc38_subscribe_registration_is_atomic() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub = handle.subscribe_events().expect("Subscribe must succeed");
+        assert_eq!(sub.subscription_id, SubscriptionId(1));
+
+        let status = handle.query_status().expect("Query status must succeed");
+        assert_eq!(status.health.active_tray_sessions, 1);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc39_initial_snapshot_contains_final_stable_session_count() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub1 = handle.subscribe_events().expect("Subscribe 1 must succeed");
+        assert_eq!(sub1.initial_snapshot.health.active_tray_sessions, 1);
+
+        let sub2 = handle.subscribe_events().expect("Subscribe 2 must succeed");
+        assert_eq!(sub2.initial_snapshot.health.active_tray_sessions, 2);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc39_full_existing_subscriber_pruned_before_new_snapshot() {
+        let mut coordinator = setup_test_coordinator();
+
+        // 1. Register subscriber A
+        let (reply_tx_a, reply_rx_a) = channel();
+        coordinator.handle_subscribe_events(reply_tx_a);
+        let sub_a = reply_rx_a.recv().unwrap().unwrap();
+        assert_eq!(sub_a.subscription_id, SubscriptionId(1));
+        assert_eq!(coordinator.health.active_tray_sessions, 1);
+
+        // 2. Fill subscriber A queue to capacity (64 events)
+        for _ in 0..64 {
+            let ev = Event::ServiceHealthUpdated {
+                health: coordinator.build_service_health_snapshot(),
+            };
+            let _ = coordinator.emit_event(ev);
+        }
+        assert_eq!(coordinator.subscribers.len(), 1);
+
+        // 3. Register subscriber B:
+        // Reconciling with existing subscriber A attempts to send ServiceHealthUpdated to A.
+        // A's queue (already 64) cannot accept the event -> TrySendError::Full -> A is pruned!
+        let (reply_tx_b, reply_rx_b) = channel();
+        coordinator.handle_subscribe_events(reply_tx_b);
+        let sub_b = reply_rx_b.recv().unwrap().unwrap();
+        assert_eq!(sub_b.subscription_id, SubscriptionId(2));
+
+        // 4. B initial snapshot must report active_tray_sessions == 1 (not 2!)
+        assert_eq!(sub_b.initial_snapshot.health.active_tray_sessions, 1);
+
+        // 5. B receiver must be empty (no self-registration event)
+        assert!(sub_b.receiver.try_recv().is_err());
+
+        // 6. Coordinator subscribers has only B
+        assert_eq!(coordinator.subscribers.len(), 1);
+        assert!(!coordinator.subscribers.contains_key(&SubscriptionId(1)));
+        assert!(coordinator.subscribers.contains_key(&SubscriptionId(2)));
+    }
+
+    #[test]
+    fn test_ipc40_event_after_subscribe_barrier_delivered_without_gap() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub_a = handle.subscribe_events().expect("Subscribe A must succeed");
+        let sub_b = handle.subscribe_events().expect("Subscribe B must succeed");
+
+        assert_eq!(sub_b.initial_snapshot.health.active_tray_sessions, 2);
+        // B receiver is empty right after subscription
+        assert!(sub_b.receiver.try_recv().is_err());
+
+        // Unsubscribe A is an operation strictly AFTER B's barrier
+        let unsub_res = handle
+            .unsubscribe_events(sub_a.subscription_id)
+            .expect("Unsubscribe A must succeed");
+        assert!(unsub_res);
+
+        // B receiver must receive the health update
+        let ev = sub_b
+            .receiver
+            .try_recv()
+            .expect("Event must be in B's receiver");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.active_tray_sessions, 1);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc41_queue_capacity_exact_64_and_65th_removes_subscriber() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let sub = reply_rx.recv().unwrap().unwrap();
+
+        // Send 64 events without draining receiver
+        for i in 0..64 {
+            let ev = Event::ServiceHealthUpdated {
+                health: coordinator.build_service_health_snapshot(),
+            };
+            let res = coordinator.emit_event(ev);
+            assert!(res.is_ok());
+            assert_eq!(
+                coordinator.subscribers.len(),
+                1,
+                "Must remain subscribed at event {}",
+                i + 1
+            );
+        }
+
+        // 65th event triggers Full and removes subscriber
+        let ev65 = Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        };
+        let res65 = coordinator.emit_event(ev65);
+        assert!(res65.is_ok());
+        assert_eq!(
+            coordinator.subscribers.len(),
+            0,
+            "65th event must prune subscriber"
+        );
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+
+        // Drain receiver: must contain exactly 64 events (65th was rejected, no drop-oldest)
+        let mut count = 0;
+        while sub.receiver.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 64, "Receiver must contain exactly 64 queued events");
+    }
+
+    #[test]
+    fn test_ipc42_disconnected_receiver_removed_on_next_event() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let sub = reply_rx.recv().unwrap().unwrap();
+        assert_eq!(coordinator.subscribers.len(), 1);
+
+        // Drop the receiver
+        drop(sub.receiver);
+
+        // Emit next event: triggers Disconnected
+        let ev = Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        };
+        let res = coordinator.emit_event(ev);
+        assert!(res.is_ok());
+        assert_eq!(coordinator.subscribers.len(), 0);
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+    }
+
+    #[test]
+    fn test_ipc43_slow_subscriber_never_blocks_coordinator() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let sub_a = reply_rx.recv().unwrap().unwrap();
+        assert_eq!(coordinator.subscribers.len(), 1);
+
+        // Fill A's queue to exactly 64 using internal test access without causing automatic removal
+        if let Some(tx_a) = coordinator.subscribers.get(&sub_a.subscription_id) {
+            for _ in 0..64 {
+                let ev = Event::ServiceHealthUpdated {
+                    health: coordinator.build_service_health_snapshot(),
+                };
+                assert!(tx_a.try_send(ev).is_ok());
+            }
+        }
+
+        // Ordinary typed event delivery encounters Full and removes subscriber A via try_send
+        let emit_ev = Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        };
+        let emit_res = coordinator.emit_event(emit_ev);
+        assert!(emit_res.is_ok());
+        assert_eq!(coordinator.subscribers.len(), 0);
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+
+        // Immediately execute another coordinator operation (QueryStatus) and verify completion
+        let (status_tx, status_rx) = channel();
+        coordinator.handle_query_status(status_tx);
+        let status = status_rx.recv().unwrap();
+        assert_eq!(status.health.active_tray_sessions, 0);
+    }
+
+    #[test]
+    fn test_ipc44_registry_length_is_only_session_count_source() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            0
+        );
+
+        let s1 = handle.subscribe_events().unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            1
+        );
+
+        let s2 = handle.subscribe_events().unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            2
+        );
+
+        let s3 = handle.subscribe_events().unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            3
+        );
+
+        handle.unsubscribe_events(s2.subscription_id).unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            2
+        );
+
+        handle.unsubscribe_events(s1.subscription_id).unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            1
+        );
+
+        handle.unsubscribe_events(s3.subscription_id).unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            0
+        );
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc44_unsubscribe_is_idempotent() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub = handle.subscribe_events().unwrap();
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            1
+        );
+
+        let first = handle.unsubscribe_events(sub.subscription_id).unwrap();
+        assert!(first);
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            0
+        );
+
+        let second = handle.unsubscribe_events(sub.subscription_id).unwrap();
+        assert!(!second);
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            0
+        );
+
+        let unknown = handle.unsubscribe_events(SubscriptionId(9999)).unwrap();
+        assert!(!unknown);
+        assert_eq!(
+            handle.query_status().unwrap().health.active_tray_sessions,
+            0
+        );
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc44_auto_remove_then_unsubscribe_does_not_change_count() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let sub = reply_rx.recv().unwrap().unwrap();
+
+        // Drop receiver and trigger auto-removal via event emission
+        drop(sub.receiver);
+        let _ = coordinator.emit_event(Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        });
+        assert_eq!(coordinator.subscribers.len(), 0);
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+
+        // Now explicitly unsubscribe the already auto-removed ID
+        let (unsub_tx, unsub_rx) = channel();
+        coordinator.handle_unsubscribe_events(sub.subscription_id, unsub_tx);
+        let unsub_res = unsub_rx.recv().unwrap().unwrap();
+        assert!(!unsub_res);
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+    }
+
+    #[test]
+    fn test_subscription_id_exhaustion_fails_without_mutation() {
+        let mut coordinator = setup_test_coordinator();
+        coordinator.next_subscription_id = None;
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let res = reply_rx.recv().unwrap();
+
+        match res {
+            Err(ServiceRuntimeError::SubscriptionIdExhausted) => {}
+            other => panic!("Expected SubscriptionIdExhausted, got {:?}", other),
+        }
+        assert_eq!(coordinator.subscribers.len(), 0);
+        assert_eq!(coordinator.health.active_tray_sessions, 0);
+    }
+
+    #[test]
+    fn test_subscription_id_collision_fails_without_mutation() {
+        let mut coordinator = setup_test_coordinator();
+
+        // Artificially insert SubscriptionId(1)
+        let (dummy_tx, dummy_rx) = sync_channel(64);
+        coordinator.subscribers.insert(SubscriptionId(1), dummy_tx);
+        coordinator.health.active_tray_sessions = 1;
+        coordinator.next_subscription_id = Some(1);
+
+        let (reply_tx, reply_rx) = channel();
+        coordinator.handle_subscribe_events(reply_tx);
+        let res = reply_rx.recv().unwrap();
+
+        match res {
+            Err(ServiceRuntimeError::SubscriptionIdExhausted) => {}
+            other => panic!(
+                "Expected SubscriptionIdExhausted on collision, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(coordinator.subscribers.len(), 1);
+        assert_eq!(coordinator.health.active_tray_sessions, 1);
+        assert_eq!(coordinator.next_subscription_id, Some(1));
+        assert!(coordinator.subscribers.contains_key(&SubscriptionId(1)));
+
+        // Verify existing sender entry was not replaced
+        let test_ev = Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        };
+        let _ = coordinator.emit_event(test_ev);
+        assert!(dummy_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_subscription_capacity_overflow_fails_without_mutation() {
+        // Normal max boundary: (u32::MAX - 1) as usize must return Ok(u32::MAX)
+        let normal_boundary = (u32::MAX - 1) as usize;
+        let normal_res = checked_prospective_active_session_count(normal_boundary);
+        assert_eq!(normal_res.unwrap(), u32::MAX);
+
+        // Overflow boundary: u32::MAX as usize must return SubscriptionCapacityExhausted
+        let overflow_boundary = u32::MAX as usize;
+        let overflow_res = checked_prospective_active_session_count(overflow_boundary);
+        match overflow_res {
+            Err(ServiceRuntimeError::SubscriptionCapacityExhausted) => {}
+            other => panic!(
+                "Expected SubscriptionCapacityExhausted at u32::MAX, got {:?}",
+                other
+            ),
+        }
+
+        // usize::MAX boundary must return SubscriptionCapacityExhausted
+        let usize_max_res = checked_prospective_active_session_count(usize::MAX);
+        match usize_max_res {
+            Err(ServiceRuntimeError::SubscriptionCapacityExhausted) => {}
+            other => panic!(
+                "Expected SubscriptionCapacityExhausted at usize::MAX, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_subscribe_reply_failure_rolls_back_registration_and_health() {
+        let mut coordinator = setup_test_coordinator();
+
+        // 1. Register subscriber A successfully
+        let (tx1, rx1) = channel();
+        coordinator.handle_subscribe_events(tx1);
+        let sub_a = rx1.recv().unwrap().unwrap();
+        assert_eq!(coordinator.health.active_tray_sessions, 1);
+
+        // 2. Drain A receiver
+        while sub_a.receiver.try_recv().is_ok() {}
+
+        // 3. Attempt subscriber B with dropped reply receiver
+        let (tx2, rx2) = channel();
+        drop(rx2); // caller disappeared
+        coordinator.handle_subscribe_events(tx2);
+
+        // 4. Coordinator must have rolled back B's registration and reconciled health
+        assert_eq!(coordinator.subscribers.len(), 1);
+        assert_eq!(coordinator.health.active_tray_sessions, 1);
+        assert!(coordinator.subscribers.contains_key(&sub_a.subscription_id));
+        assert!(!coordinator.subscribers.contains_key(&SubscriptionId(2)));
+
+        // 5. A receives the final reconciliation event showing active_tray_sessions == 1
+        let mut last_session_count = None;
+        while let Ok(ev) = sub_a.receiver.try_recv() {
+            if let Event::ServiceHealthUpdated { health } = ev {
+                last_session_count = Some(health.active_tray_sessions);
+            }
+        }
+        assert_eq!(last_session_count, Some(1));
+    }
+
+    #[test]
+    fn test_new_subscriber_receives_no_self_registration_health_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub1 = handle.subscribe_events().unwrap();
+        let sub2 = handle.subscribe_events().unwrap();
+
+        // sub2 received NO event from its own registration
+        assert!(sub2.receiver.try_recv().is_err());
+
+        // sub1 did receive the event for sub2's registration
+        let ev = sub1.receiver.try_recv().expect("sub1 must receive update");
+        match ev {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.active_tray_sessions, 2);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_unsubscribe_emits_health_to_remaining_subscribers() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub1 = handle.subscribe_events().unwrap();
+        let sub2 = handle.subscribe_events().unwrap();
+        let sub3 = handle.subscribe_events().unwrap();
+
+        // Drain sub2 and sub3
+        while sub2.receiver.try_recv().is_ok() {}
+        while sub3.receiver.try_recv().is_ok() {}
+
+        handle.unsubscribe_events(sub1.subscription_id).unwrap();
+
+        let ev2 = sub2
+            .receiver
+            .try_recv()
+            .expect("sub2 must receive health event");
+        match ev2 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.active_tray_sessions, 2);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        let ev3 = sub3
+            .receiver
+            .try_recv()
+            .expect("sub3 must receive health event");
+        match ev3 {
+            Event::ServiceHealthUpdated { health } => {
+                assert_eq!(health.active_tray_sessions, 2);
+            }
+            other => panic!("Expected ServiceHealthUpdated, got {:?}", other),
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_health_stabilization_converges_to_final_registry_count() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (tx1, rx1) = channel();
+        coordinator.handle_subscribe_events(tx1);
+        let sub1 = rx1.recv().unwrap().unwrap();
+
+        let (tx2, rx2) = channel();
+        coordinator.handle_subscribe_events(tx2);
+        let sub2 = rx2.recv().unwrap().unwrap();
+
+        let (tx3, rx3) = channel();
+        coordinator.handle_subscribe_events(tx3);
+        let sub3 = rx3.recv().unwrap().unwrap();
+
+        assert_eq!(coordinator.health.active_tray_sessions, 3);
+
+        // Drain sub1, sub2, and sub3
+        while sub1.receiver.try_recv().is_ok() {}
+        while sub2.receiver.try_recv().is_ok() {}
+        while sub3.receiver.try_recv().is_ok() {}
+
+        // Fill sub2 queue directly to 64 (will encounter Full)
+        if let Some(tx2) = coordinator.subscribers.get(&sub2.subscription_id) {
+            for _ in 0..64 {
+                let _ = tx2.try_send(Event::ServiceHealthUpdated {
+                    health: coordinator.build_service_health_snapshot(),
+                });
+            }
+        }
+
+        // Drop sub3 receiver (will encounter Disconnected)
+        drop(sub3.receiver);
+
+        // Emit an event to trigger delivery, pruning of sub2 & sub3, and iterative health reconciliation
+        let emit_ev = Event::ServiceHealthUpdated {
+            health: coordinator.build_service_health_snapshot(),
+        };
+        let emit_res = coordinator.emit_event(emit_ev);
+        assert!(emit_res.is_ok());
+
+        // Final stable state: exactly survivor sub1 remains, health == 1
+        assert_eq!(coordinator.subscribers.len(), 1);
+        assert_eq!(coordinator.health.active_tray_sessions, 1);
+        assert!(coordinator.subscribers.contains_key(&sub1.subscription_id));
+
+        // Survivor sub1 receives final health update showing active_tray_sessions == 1
+        let mut final_session_count = None;
+        while let Ok(ev) = sub1.receiver.try_recv() {
+            if let Event::ServiceHealthUpdated { health } = ev {
+                final_session_count = Some(health.active_tray_sessions);
+            }
+        }
+        assert_eq!(final_session_count, Some(1));
+
+        drop(sub2);
+    }
+
+    #[test]
+    fn test_runtime_stop_clears_subscribers_and_disconnects_receivers() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let sub1 = handle.subscribe_events().unwrap();
+        let sub2 = handle.subscribe_events().unwrap();
+
+        runtime.stop().expect("Runtime stop must succeed");
+
+        // Drain any buffered events and verify channel disconnected
+        while sub1.receiver.try_recv().is_ok() {}
+        while sub2.receiver.try_recv().is_ok() {}
+
+        assert!(sub1.receiver.recv().is_err());
+        assert!(sub2.receiver.recv().is_err());
     }
 }
