@@ -6,6 +6,9 @@ pub mod id_source;
 #[cfg(windows)]
 mod id_source_windows;
 pub mod internet_gate;
+pub mod named_pipe;
+#[cfg(windows)]
+mod named_pipe_windows;
 pub mod power;
 #[cfg(windows)]
 pub mod power_windows;
@@ -74,4 +77,14 @@ pub use power::{
 pub use power_windows::{
     AlignedBuffer, SafeHandle, WindowsPowerEngine, raw_win32_code_from_error,
     raw_win32_code_from_hresult,
+};
+
+pub use named_pipe::{
+    CANONICAL_PIPE_NAME, CHILD_PIPE_CLIENT_DESIRED_ACCESS_MASK,
+    CHILD_PIPE_DACL_ALLOWED_ACCESS_MASK, ClientSecurityContext, ConfiguredChildSid,
+    INITIAL_FRAME_PREFIX_BYTES, INITIAL_REQUEST_LENGTH_MAX, INITIAL_REQUEST_LENGTH_MIN,
+    MAX_INITIAL_CLIENT_REQUEST_BYTES, MAX_PIPE_INSTANCES, NamedPipeConnection, NamedPipeError,
+    NamedPipeServer, NamedPipeServerInstance, REVERT_TO_SELF_FAILURE_POLICY, ValidatedSid,
+    is_active_administrator_group, revert_to_self_failure_is_fatal,
+    validate_initial_request_prefix,
 };
