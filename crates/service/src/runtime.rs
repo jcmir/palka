@@ -19,10 +19,9 @@ use crate::state_store::{StateFileStore, StateStoreError};
 use palka_core::{
     ActionExecutionState, ActionKind, Deadline, DesiredInternetState, Event, HealthStatus,
     Initiator, InternetState, ScheduledAction, ServiceHealth, ShutdownState, StatusSnapshot,
-    TimerId, UtcDateTime, WarningThreshold, action_state_is_terminal, creation_due_thresholds,
-    creation_passed_thresholds, crossed_warning_thresholds, execution_failure_transition,
-    execution_success_transition, recovery_overdue_transition, recovery_passed_thresholds,
-    runtime_deadline_transition, shutdown_cancel_allowed,
+    TimerId, UtcDateTime, WarningThreshold, creation_due_thresholds, creation_passed_thresholds,
+    crossed_warning_thresholds, execution_failure_transition, execution_success_transition,
+    recovery_overdue_transition, recovery_passed_thresholds, runtime_deadline_transition,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -401,6 +400,13 @@ struct MonotonicTimerAnchor {
 // 6. RUNTIME COMMAND MESSAGES
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimerCancellationResult {
+    Cancelled,
+    AlreadyAbsent,
+    TimerKindMismatch,
+}
+
 enum RuntimeCommand {
     ScheduleAction {
         action_kind: ActionKind,
@@ -408,10 +414,11 @@ enum RuntimeCommand {
         initiator: Initiator,
         reply: Sender<Result<TimerId, ServiceRuntimeError>>,
     },
-    CancelTimer {
+    CancelExactTimer {
         timer_id: TimerId,
+        expected_action_kind: ActionKind,
         initiator: Initiator,
-        reply: Sender<Result<(), ServiceRuntimeError>>,
+        reply: Sender<Result<TimerCancellationResult, ServiceRuntimeError>>,
     },
     ImmediateInternetBlock {
         initiator: Initiator,
@@ -1139,7 +1146,7 @@ where
                 RuntimeCommand::ScheduleAction { reply, .. } => {
                     let _ = reply.send(Err(ServiceRuntimeError::Stopping));
                 }
-                RuntimeCommand::CancelTimer { reply, .. } => {
+                RuntimeCommand::CancelExactTimer { reply, .. } => {
                     let _ = reply.send(Err(ServiceRuntimeError::Stopping));
                 }
                 RuntimeCommand::ImmediateInternetBlock { reply, .. } => {
@@ -1171,12 +1178,13 @@ where
                 let res = self.handle_schedule_action(action_kind, duration_seconds, initiator);
                 let _ = reply.send(res);
             }
-            RuntimeCommand::CancelTimer {
+            RuntimeCommand::CancelExactTimer {
                 timer_id,
+                expected_action_kind,
                 initiator,
                 reply,
             } => {
-                let res = self.handle_cancel_timer(timer_id, initiator);
+                let res = self.handle_cancel_exact_timer(timer_id, expected_action_kind, initiator);
                 let _ = reply.send(res);
             }
             RuntimeCommand::ImmediateInternetBlock { initiator, reply } => {
@@ -1302,19 +1310,24 @@ where
         Ok(timer_id)
     }
 
-    fn handle_cancel_timer(
+    fn handle_cancel_exact_timer(
         &mut self,
         timer_id: TimerId,
+        expected_action_kind: ActionKind,
         _initiator: Initiator,
-    ) -> Result<(), ServiceRuntimeError> {
-        let action = self
-            .state
-            .active_actions
-            .iter()
-            .find(|a| a.id == timer_id)
-            .ok_or(ServiceRuntimeError::ActionNotFound(timer_id))?;
+    ) -> Result<TimerCancellationResult, ServiceRuntimeError> {
+        // Step 1: Exact TimerId lookup
+        let action = match self.state.active_actions.iter().find(|a| a.id == timer_id) {
+            Some(a) => a,
+            None => return Ok(TimerCancellationResult::AlreadyAbsent),
+        };
 
-        // Section 21: only a genuinely pending scheduled timer may use the timer-cancellation path.
+        // Step 2: Expected ActionKind validation
+        if action.action_kind != expected_action_kind {
+            return Ok(TimerCancellationResult::TimerKindMismatch);
+        }
+
+        // Step 3: Execution state validation - only Pending is cancellable
         if !matches!(action.execution_state, ActionExecutionState::Pending) {
             return Err(ServiceRuntimeError::CancellationForbidden(format!(
                 "Action in state {:?} cannot be cancelled; only Pending actions are cancellable",
@@ -1322,32 +1335,57 @@ where
             )));
         }
 
-        if action.action_kind == ActionKind::ShutdownComputer {
-            let now_utc = self.clock.utc_now();
-            let delta_ms = action.deadline.0.0 - now_utc.0;
-            let remaining = remaining_seconds_from_delta_ms(delta_ms);
-            if !shutdown_cancel_allowed(remaining) {
+        // Step 4: Shutdown-only monotonic deadline & anchor validation
+        if expected_action_kind == ActionKind::ShutdownComputer {
+            let anchor = match self.monotonic_timers.get(&timer_id) {
+                Some(a) => a,
+                None => {
+                    return Err(ServiceRuntimeError::CancellationForbidden(
+                        "Monotonic timer anchor unavailable for pending shutdown action"
+                            .to_string(),
+                    ));
+                }
+            };
+
+            if anchor.action_kind != action.action_kind {
+                return Err(ServiceRuntimeError::CancellationForbidden(
+                    "Monotonic timer anchor kind mismatch for pending shutdown action".to_string(),
+                ));
+            }
+
+            let now_mono = self.clock.monotonic_now();
+            if now_mono >= anchor.monotonic_target {
                 return Err(ServiceRuntimeError::CancellationForbidden(
                     "Shutdown cancellation boundary has passed".to_string(),
                 ));
             }
         }
 
-        if action_state_is_terminal(&action.execution_state) {
+        // Step 5: Candidate construction & durable commit
+        let mut candidate = self.state.clone();
+        let initial_count = candidate.active_actions.len();
+        candidate.active_actions.retain(|a| a.id != timer_id);
+        if candidate.active_actions.len() + 1 != initial_count {
             return Err(ServiceRuntimeError::CancellationForbidden(
-                "Terminal action cannot be cancelled".to_string(),
+                "Failed to target exactly one action for cancellation".to_string(),
             ));
         }
-
-        let mut candidate = self.state.clone();
-        candidate.active_actions.retain(|a| a.id != timer_id);
 
         self.log_event("save:cancel_timer");
         self.commit_authoritative_state(candidate)
             .map_err(ServiceRuntimeError::Persistence)?;
+
+        // Step 6: Monotonic anchor removal
         self.monotonic_timers.remove(&timer_id);
 
-        Ok(())
+        // Step 7: Typed broadcast event (best-effort, live at-most-once)
+        let _ = self.emit_event(Event::TimerCancelled {
+            id: timer_id,
+            action_kind: expected_action_kind,
+        });
+
+        // Step 8: Return Cancelled
+        Ok(TimerCancellationResult::Cancelled)
     }
 
     fn handle_immediate_block(&mut self, _initiator: Initiator) -> Result<(), ServiceRuntimeError> {
@@ -2141,11 +2179,12 @@ impl RuntimeHandle {
             .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
     }
 
-    pub fn cancel_timer(
+    #[allow(dead_code)]
+    pub(crate) fn cancel_internet_block_timer(
         &self,
         timer_id: TimerId,
         initiator: Initiator,
-    ) -> Result<(), ServiceRuntimeError> {
+    ) -> Result<TimerCancellationResult, ServiceRuntimeError> {
         let reply_rx = {
             let guard = self.ingress.lock().unwrap();
             if *guard {
@@ -2153,8 +2192,38 @@ impl RuntimeHandle {
             }
             let (reply_tx, reply_rx) = channel();
             self.command_tx
-                .send(RuntimeCommand::CancelTimer {
+                .send(RuntimeCommand::CancelExactTimer {
                     timer_id,
+                    expected_action_kind: ActionKind::BlockInternet,
+                    initiator,
+                    reply: reply_tx,
+                })
+                .map_err(|e| {
+                    ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string()))
+                })?;
+            reply_rx
+        };
+        reply_rx
+            .recv()
+            .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_shutdown_timer(
+        &self,
+        timer_id: TimerId,
+        initiator: Initiator,
+    ) -> Result<TimerCancellationResult, ServiceRuntimeError> {
+        let reply_rx = {
+            let guard = self.ingress.lock().unwrap();
+            if *guard {
+                return Err(ServiceRuntimeError::Stopping);
+            }
+            let (reply_tx, reply_rx) = channel();
+            self.command_tx
+                .send(RuntimeCommand::CancelExactTimer {
+                    timer_id,
+                    expected_action_kind: ActionKind::ShutdownComputer,
                     initiator,
                     reply: reply_tx,
                 })
@@ -4323,9 +4392,10 @@ mod tests {
         // 1ms before deadline: cancellation MUST succeed
         let res = runtime
             .handle()
-            .cancel_timer(timer_id, Initiator::ParentLocalPin);
-        assert!(
-            res.is_ok(),
+            .cancel_shutdown_timer(timer_id, Initiator::ParentLocalPin);
+        assert_eq!(
+            res.unwrap(),
+            TimerCancellationResult::Cancelled,
             "+1ms before deadline cancellation must be allowed"
         );
 
@@ -4386,7 +4456,7 @@ mod tests {
 
         let res1 = runtime
             .handle()
-            .cancel_timer(timer_id1, Initiator::ParentLocalPin);
+            .cancel_internet_block_timer(timer_id1, Initiator::ParentLocalPin);
         assert!(
             matches!(res1, Err(ServiceRuntimeError::CancellationForbidden(_))),
             "Executing action cannot be cancelled"
@@ -4394,7 +4464,7 @@ mod tests {
 
         let res2 = runtime
             .handle()
-            .cancel_timer(timer_id2, Initiator::ParentLocalPin);
+            .cancel_shutdown_timer(timer_id2, Initiator::ParentLocalPin);
         assert!(
             matches!(res2, Err(ServiceRuntimeError::CancellationForbidden(_))),
             "Failed action cannot be cancelled"
@@ -4992,7 +5062,8 @@ mod tests {
             "Mutation after stop must be rejected with Stopping"
         );
 
-        let post_cancel = handle.cancel_timer(TimerId([1; 16]), Initiator::ParentLocalPin);
+        let post_cancel =
+            handle.cancel_internet_block_timer(TimerId([1; 16]), Initiator::ParentLocalPin);
         assert!(
             matches!(post_cancel, Err(ServiceRuntimeError::Stopping)),
             "Cancel timer after stop must be rejected with Stopping"
@@ -7753,5 +7824,777 @@ mod tests {
 
         assert!(sub1.receiver.recv().is_err());
         assert!(sub2.receiver.recv().is_err());
+    }
+
+    // ========================================================================
+    // SLICE 3B: EXACT TIMER CANCELLATION TESTS (26 tests)
+    // ========================================================================
+
+    #[test]
+    fn test_ipc71_cancel_internet_block_absent_returns_already_absent() {
+        let (mut runtime, _clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let absent_id = TimerId([0xEE; 16]);
+        let res = handle.cancel_internet_block_timer(absent_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::AlreadyAbsent);
+
+        // No persistence save logged
+        let logs = log.lock().unwrap().clone();
+        assert!(!logs.iter().any(|l| l.contains("cancel_timer")));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc71_cancel_shutdown_absent_returns_already_absent() {
+        let (mut runtime, _clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let absent_id = TimerId([0xEE; 16]);
+        let res = handle.cancel_shutdown_timer(absent_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::AlreadyAbsent);
+
+        // No persistence save logged
+        let logs = log.lock().unwrap().clone();
+        assert!(!logs.iter().any(|l| l.contains("cancel_timer")));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc72_cancel_internet_with_shutdown_id_returns_timer_kind_mismatch() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(300, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Attempting to cancel shutdown timer via cancel_internet_block_timer returns TimerKindMismatch
+        let res = handle.cancel_internet_block_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::TimerKindMismatch);
+
+        // Shutdown timer still exists in status snapshot
+        let snap = handle.query_status().unwrap();
+        assert_eq!(snap.active_actions.len(), 1);
+        assert_eq!(snap.active_actions[0].id, shutdown_id);
+        assert_eq!(
+            snap.active_actions[0].action_kind,
+            ActionKind::ShutdownComputer
+        );
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc72_cancel_shutdown_with_internet_id_returns_timer_kind_mismatch() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let block_id = handle
+            .schedule_internet_block(300, Initiator::ParentLocalPin)
+            .expect("Schedule internet block must succeed");
+
+        // Attempting to cancel internet block timer via cancel_shutdown_timer returns TimerKindMismatch
+        let res = handle.cancel_shutdown_timer(block_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::TimerKindMismatch);
+
+        // BlockInternet timer still exists in status snapshot
+        let snap = handle.query_status().unwrap();
+        assert_eq!(snap.active_actions.len(), 1);
+        assert_eq!(snap.active_actions[0].id, block_id);
+        assert_eq!(
+            snap.active_actions[0].action_kind,
+            ActionKind::BlockInternet
+        );
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc73_repeated_internet_cancellation_is_idempotent() {
+        let (mut runtime, _clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let block_id = handle
+            .schedule_internet_block(300, Initiator::ParentLocalPin)
+            .expect("Schedule internet block must succeed");
+
+        // First cancellation -> Cancelled
+        let res1 = handle.cancel_internet_block_timer(block_id, Initiator::ParentLocalPin);
+        assert_eq!(res1.unwrap(), TimerCancellationResult::Cancelled);
+
+        // Second cancellation -> AlreadyAbsent
+        let res2 = handle.cancel_internet_block_timer(block_id, Initiator::ParentLocalPin);
+        assert_eq!(res2.unwrap(), TimerCancellationResult::AlreadyAbsent);
+
+        // Exactly one save:cancel_timer logged
+        let logs = log.lock().unwrap().clone();
+        let cancel_saves = logs.iter().filter(|l| *l == "save:cancel_timer").count();
+        assert_eq!(cancel_saves, 1);
+
+        // Exactly one TimerCancelled event received
+        let mut cancel_event_count = 0;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { id, action_kind } = ev {
+                assert_eq!(id, block_id);
+                assert_eq!(action_kind, ActionKind::BlockInternet);
+                cancel_event_count += 1;
+            }
+        }
+        assert_eq!(cancel_event_count, 1);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc73_repeated_shutdown_cancellation_is_idempotent() {
+        let (mut runtime, _clock, log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let shutdown_id = handle
+            .schedule_shutdown(300, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // First cancellation -> Cancelled
+        let res1 = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert_eq!(res1.unwrap(), TimerCancellationResult::Cancelled);
+
+        // Second cancellation -> AlreadyAbsent
+        let res2 = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert_eq!(res2.unwrap(), TimerCancellationResult::AlreadyAbsent);
+
+        // Exactly one save:cancel_timer logged
+        let logs = log.lock().unwrap().clone();
+        let cancel_saves = logs.iter().filter(|l| *l == "save:cancel_timer").count();
+        assert_eq!(cancel_saves, 1);
+
+        // Exactly one TimerCancelled event received
+        let mut cancel_event_count = 0;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { id, action_kind } = ev {
+                assert_eq!(id, shutdown_id);
+                assert_eq!(action_kind, ActionKind::ShutdownComputer);
+                cancel_event_count += 1;
+            }
+        }
+        assert_eq!(cancel_event_count, 1);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc74_shutdown_cancel_before_monotonic_deadline_succeeds() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Advance 5 seconds (target is 10s from start)
+        clock.advance(Duration::from_secs(5));
+
+        let res = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc74_shutdown_cancel_at_exact_monotonic_deadline_rejected() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Advance exactly 10 seconds to hit monotonic target
+        clock.advance(Duration::from_secs(10));
+
+        let res = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc74_shutdown_cancel_after_monotonic_deadline_rejected() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Advance 15 seconds past monotonic target
+        clock.advance(Duration::from_secs(15));
+
+        let res = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc74_utc_backward_jump_does_not_reopen_expired_shutdown_cancellation() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(10, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Advance monotonic clock past target (12s)
+        clock.advance(Duration::from_secs(12));
+
+        // Shift UTC wall clock backward by 100 seconds
+        clock.shift_utc_only(-100_000);
+
+        // Cancellation must still be rejected based on monotonic target authority
+        let res = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_ipc74_utc_forward_jump_does_not_prematurely_reject_unexpired_shutdown_cancellation() {
+        let (mut runtime, clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let shutdown_id = handle
+            .schedule_shutdown(100, Initiator::ParentLocalPin)
+            .expect("Schedule shutdown must succeed");
+
+        // Monotonic time is still at 0 (well before 100s target), but shift UTC forward by 1000s
+        clock.shift_utc_only(1_000_000);
+
+        // Cancellation must still succeed based on monotonic target authority
+        let res = handle.cancel_shutdown_timer(shutdown_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_exact_timer_id_isolation_among_multiple_actions() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let id_a = handle
+            .schedule_internet_block(60, Initiator::ParentLocalPin)
+            .unwrap();
+        let id_b = handle
+            .schedule_internet_block(120, Initiator::ParentLocalPin)
+            .unwrap();
+        let id_c = handle
+            .schedule_shutdown(180, Initiator::ParentLocalPin)
+            .unwrap();
+
+        // Cancel B
+        let res_b = handle.cancel_internet_block_timer(id_b, Initiator::ParentLocalPin);
+        assert_eq!(res_b.unwrap(), TimerCancellationResult::Cancelled);
+
+        // Verify A and C remain in state
+        let snap = handle.query_status().unwrap();
+        let ids: Vec<_> = snap.active_actions.iter().map(|a| a.id).collect();
+        assert!(ids.contains(&id_a));
+        assert!(!ids.contains(&id_b));
+        assert!(ids.contains(&id_c));
+
+        // Event emitted only for B
+        let mut cancelled_ids = Vec::new();
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { id, .. } = ev {
+                cancelled_ids.push(id);
+            }
+        }
+        assert_eq!(cancelled_ids, vec![id_b]);
+
+        // Cancel C
+        let res_c = handle.cancel_shutdown_timer(id_c, Initiator::ParentLocalPin);
+        assert_eq!(res_c.unwrap(), TimerCancellationResult::Cancelled);
+
+        // A still remains
+        let snap2 = handle.query_status().unwrap();
+        let ids2: Vec<_> = snap2.active_actions.iter().map(|a| a.id).collect();
+        assert_eq!(ids2, vec![id_a]);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_successful_internet_timer_cancellation_removes_action_and_anchor() {
+        let mut coordinator = setup_test_coordinator();
+
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 60, Initiator::ParentLocalPin)
+            .unwrap();
+
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+        assert!(coordinator.monotonic_timers.contains_key(&timer_id));
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        assert_eq!(coordinator.state.active_actions.len(), 0);
+        assert!(!coordinator.monotonic_timers.contains_key(&timer_id));
+    }
+
+    #[test]
+    fn test_successful_shutdown_timer_cancellation_removes_action_and_anchor() {
+        let mut coordinator = setup_test_coordinator();
+
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::ShutdownComputer, 60, Initiator::ParentLocalPin)
+            .unwrap();
+
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+        assert!(coordinator.monotonic_timers.contains_key(&timer_id));
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::ShutdownComputer,
+            Initiator::ParentLocalPin,
+        );
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        assert_eq!(coordinator.state.active_actions.len(), 0);
+        assert!(!coordinator.monotonic_timers.contains_key(&timer_id));
+    }
+
+    #[test]
+    fn test_executing_action_cancellation_forbidden() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x11; 16]);
+
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Executing,
+        });
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+    }
+
+    #[test]
+    fn test_failed_action_cancellation_forbidden() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x22; 16]);
+
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Failed {
+                reason: "Power controller error".to_string(),
+            },
+        });
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::ShutdownComputer,
+            Initiator::ParentLocalPin,
+        );
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+    }
+
+    #[test]
+    fn test_completed_action_cancellation_forbidden() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x33; 16]);
+
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Completed,
+        });
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+    }
+
+    #[test]
+    fn test_missed_action_cancellation_forbidden() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x44; 16]);
+
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Missed,
+        });
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::ShutdownComputer,
+            Initiator::ParentLocalPin,
+        );
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+    }
+
+    #[test]
+    fn test_shutdown_cancel_missing_monotonic_anchor_fails_closed() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x55; 16]);
+
+        // Action exists in authoritative state, but monotonic anchor is absent
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Pending,
+        });
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::ShutdownComputer,
+            Initiator::ParentLocalPin,
+        );
+        match res {
+            Err(ServiceRuntimeError::CancellationForbidden(msg)) => {
+                assert!(msg.contains("Monotonic timer anchor unavailable"));
+            }
+            other => panic!("Expected CancellationForbidden, got {:?}", other),
+        }
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+    }
+
+    #[test]
+    fn test_shutdown_cancel_mismatched_anchor_kind_fails_closed() {
+        let mut coordinator = setup_test_coordinator();
+        let timer_id = TimerId([0x66; 16]);
+        let now_mono = coordinator.clock.monotonic_now();
+
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::ShutdownComputer,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Pending,
+        });
+
+        // Anchor has mismatched ActionKind::BlockInternet
+        coordinator.monotonic_timers.insert(
+            timer_id,
+            MonotonicTimerAnchor {
+                timer_id,
+                action_kind: ActionKind::BlockInternet,
+                utc_deadline: Deadline(UtcDateTime(2000000)),
+                monotonic_target: now_mono + Duration::from_secs(60),
+                original_duration_seconds: 60,
+                monotonic_start: now_mono,
+                last_evaluated_remaining_seconds: 60,
+            },
+        );
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::ShutdownComputer,
+            Initiator::ParentLocalPin,
+        );
+        match res {
+            Err(ServiceRuntimeError::CancellationForbidden(msg)) => {
+                assert!(msg.contains("Monotonic timer anchor kind mismatch"));
+            }
+            other => panic!("Expected CancellationForbidden, got {:?}", other),
+        }
+        assert_eq!(coordinator.state.active_actions.len(), 1);
+        assert!(coordinator.monotonic_timers.contains_key(&timer_id));
+    }
+
+    #[test]
+    fn test_persistence_failure_leaves_action_and_anchor_unmodified_without_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+        let timer_id = TimerId([0x77; 16]);
+        initial_state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Pending,
+        });
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime construction must succeed");
+
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        // Inject save failure
+        store.fail_saves.store(true, Ordering::SeqCst);
+
+        // Cancellation attempt fails with Persistence error
+        let res_fail = handle.cancel_internet_block_timer(timer_id, Initiator::ParentLocalPin);
+        assert!(matches!(res_fail, Err(ServiceRuntimeError::Persistence(_))));
+
+        // Action is still present in status snapshot
+        let snap = handle.query_status().unwrap();
+        assert_eq!(snap.active_actions.len(), 1);
+        assert_eq!(snap.active_actions[0].id, timer_id);
+
+        // No TimerCancelled event emitted
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { .. } = ev {
+                panic!("TimerCancelled event must NOT be emitted on persistence failure");
+            }
+        }
+
+        // Retry without save failure succeeds
+        store.fail_saves.store(false, Ordering::SeqCst);
+        let res_ok = handle.cancel_internet_block_timer(timer_id, Initiator::ParentLocalPin);
+        assert_eq!(res_ok.unwrap(), TimerCancellationResult::Cancelled);
+
+        // Action is now removed
+        let snap2 = handle.query_status().unwrap();
+        assert_eq!(snap2.active_actions.len(), 0);
+
+        // Exactly one TimerCancelled event received
+        let mut cancel_event_count = 0;
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { id, .. } = ev {
+                assert_eq!(id, timer_id);
+                cancel_event_count += 1;
+            }
+        }
+        assert_eq!(cancel_event_count, 1);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_durable_commit_precedes_timer_cancelled_event() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 60, Initiator::ParentLocalPin)
+            .unwrap();
+
+        // Drain subscription receiver
+        while sub.receiver.try_recv().is_ok() {}
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        // State is already committed and anchor removed
+        assert!(coordinator.state.active_actions.is_empty());
+        assert!(!coordinator.monotonic_timers.contains_key(&timer_id));
+
+        // TimerCancelled is in the receiver
+        let ev = sub.receiver.try_recv().expect("Event must be delivered");
+        match ev {
+            Event::TimerCancelled { id, action_kind } => {
+                assert_eq!(id, timer_id);
+                assert_eq!(action_kind, ActionKind::BlockInternet);
+            }
+            other => panic!("Expected TimerCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_already_absent_emits_no_timer_cancelled_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let res =
+            handle.cancel_internet_block_timer(TimerId([0x99; 16]), Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::AlreadyAbsent);
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { .. } = ev {
+                panic!("No TimerCancelled event must be emitted on AlreadyAbsent");
+            }
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_timer_kind_mismatch_emits_no_timer_cancelled_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let timer_id = handle
+            .schedule_shutdown(60, Initiator::ParentLocalPin)
+            .unwrap();
+
+        // Drain receiver
+        while sub.receiver.try_recv().is_ok() {}
+
+        let res = handle.cancel_internet_block_timer(timer_id, Initiator::ParentLocalPin);
+        assert_eq!(res.unwrap(), TimerCancellationResult::TimerKindMismatch);
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { .. } = ev {
+                panic!("No TimerCancelled event must be emitted on TimerKindMismatch");
+            }
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_cancellation_forbidden_emits_no_timer_cancelled_event() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        let timer_id = TimerId([0xAA; 16]);
+        coordinator.state.active_actions.push(ScheduledAction {
+            id: timer_id,
+            action_kind: ActionKind::BlockInternet,
+            deadline: Deadline(UtcDateTime(2000000)),
+            created_at: UtcDateTime(1000000),
+            created_by: Initiator::ParentLocalPin,
+            emitted_thresholds: std::collections::HashSet::new(),
+            execution_state: ActionExecutionState::Executing,
+        });
+
+        while sub.receiver.try_recv().is_ok() {}
+
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert!(matches!(
+            res,
+            Err(ServiceRuntimeError::CancellationForbidden(_))
+        ));
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::TimerCancelled { .. } = ev {
+                panic!("No TimerCancelled event must be emitted on CancellationForbidden");
+            }
+        }
+    }
+
+    #[test]
+    fn test_timer_cancelled_delivery_failure_does_not_change_cancelled_result() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        let timer_id = coordinator
+            .handle_schedule_action(ActionKind::BlockInternet, 60, Initiator::ParentLocalPin)
+            .unwrap();
+
+        // Drop subscriber's receiver to simulate disconnected delivery
+        drop(sub.receiver);
+
+        // Cancellation must still succeed durably and return Cancelled
+        let res = coordinator.handle_cancel_exact_timer(
+            timer_id,
+            ActionKind::BlockInternet,
+            Initiator::ParentLocalPin,
+        );
+        assert_eq!(res.unwrap(), TimerCancellationResult::Cancelled);
+
+        // Action and anchor are removed
+        assert!(coordinator.state.active_actions.is_empty());
+        assert!(!coordinator.monotonic_timers.contains_key(&timer_id));
     }
 }
