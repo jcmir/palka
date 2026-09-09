@@ -17,11 +17,12 @@ use crate::persistence::{
 };
 use crate::state_store::{StateFileStore, StateStoreError};
 use palka_core::{
-    ActionExecutionState, ActionKind, Deadline, DesiredInternetState, Event, HealthStatus,
-    Initiator, InternetState, ScheduledAction, ServiceHealth, ShutdownState, StatusSnapshot,
-    TimerId, UtcDateTime, WarningThreshold, creation_due_thresholds, creation_passed_thresholds,
-    crossed_warning_thresholds, execution_failure_transition, execution_success_transition,
-    recovery_overdue_transition, recovery_passed_thresholds, runtime_deadline_transition,
+    ActionExecutionState, ActionKind, ChatMessage, Deadline, DeliveryStatus, DesiredInternetState,
+    Event, HealthStatus, Initiator, InternetState, MessageId, MessageSender, ScheduledAction,
+    ServiceHealth, ShutdownState, StatusSnapshot, TimerId, UtcDateTime, WarningThreshold,
+    creation_due_thresholds, creation_passed_thresholds, crossed_warning_thresholds,
+    execution_failure_transition, execution_success_transition, recovery_overdue_transition,
+    recovery_passed_thresholds, runtime_deadline_transition,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -441,6 +442,14 @@ enum RuntimeCommand {
     UnsubscribeEvents {
         subscription_id: SubscriptionId,
         reply: Sender<Result<bool, ServiceRuntimeError>>,
+    },
+    SendChildMessage {
+        text: String,
+        reply: Sender<Result<MessageId, ServiceRuntimeError>>,
+    },
+    PublishParentMessage {
+        message: ChatMessage,
+        reply: Sender<Result<(), ServiceRuntimeError>>,
     },
     #[cfg(test)]
     Tick {
@@ -1164,6 +1173,12 @@ where
                 RuntimeCommand::UnsubscribeEvents { reply, .. } => {
                     let _ = reply.send(Err(ServiceRuntimeError::Stopping));
                 }
+                RuntimeCommand::SendChildMessage { reply, .. } => {
+                    let _ = reply.send(Err(ServiceRuntimeError::Stopping));
+                }
+                RuntimeCommand::PublishParentMessage { reply, .. } => {
+                    let _ = reply.send(Err(ServiceRuntimeError::Stopping));
+                }
             }
             return;
         }
@@ -1197,6 +1212,14 @@ where
             }
             RuntimeCommand::AckTelegram { entry_id, reply } => {
                 let res = self.handle_ack_telegram(entry_id);
+                let _ = reply.send(res);
+            }
+            RuntimeCommand::SendChildMessage { text, reply } => {
+                let res = self.handle_send_child_message(text);
+                let _ = reply.send(res);
+            }
+            RuntimeCommand::PublishParentMessage { message, reply } => {
+                let res = self.handle_publish_parent_message(message);
                 let _ = reply.send(res);
             }
             RuntimeCommand::QueryStatus { reply } => {
@@ -1600,6 +1623,61 @@ where
         } else {
             Ok(false)
         }
+    }
+
+    fn handle_send_child_message(
+        &mut self,
+        text: String,
+    ) -> Result<MessageId, ServiceRuntimeError> {
+        let byte_len = text.as_bytes().len();
+        if byte_len == 0 || byte_len > 4096 || text.trim().is_empty() {
+            return Err(ServiceRuntimeError::InvalidInput(
+                "Child chat message text must be 1..=4096 UTF-8 bytes and non-whitespace"
+                    .to_string(),
+            ));
+        }
+
+        let entry_id = self.id_source.next_outbox_id();
+        let message_id = MessageId(entry_id.0);
+        let now_utc = self.clock.utc_now();
+
+        let chat_message = ChatMessage {
+            id: message_id,
+            sender: MessageSender::Child,
+            text,
+            timestamp: now_utc,
+            delivery_status: DeliveryStatus::AcceptedByService,
+        };
+
+        let mut candidate = self.state.clone();
+        candidate.telegram_outbox.push(TelegramOutboxEntry {
+            entry_id,
+            payload: TelegramPayload::Chat {
+                message: chat_message,
+            },
+            attempt_count: 0,
+            last_error: None,
+        });
+
+        self.log_event("save:send_child_message");
+        self.commit_authoritative_state(candidate)
+            .map_err(ServiceRuntimeError::Persistence)?;
+
+        Ok(message_id)
+    }
+
+    fn handle_publish_parent_message(
+        &mut self,
+        message: ChatMessage,
+    ) -> Result<(), ServiceRuntimeError> {
+        if message.sender != MessageSender::Parent {
+            return Err(ServiceRuntimeError::InvalidInput(
+                "Parent chat message must have MessageSender::Parent".to_string(),
+            ));
+        }
+
+        let _ = self.emit_event(Event::ChatMessageReceived { message });
+        Ok(())
     }
 
     /// Evaluates monotonic time thresholds, deadlines, and retry timers.
@@ -2359,6 +2437,58 @@ impl RuntimeHandle {
             self.command_tx
                 .send(RuntimeCommand::UnsubscribeEvents {
                     subscription_id,
+                    reply: reply_tx,
+                })
+                .map_err(|e| {
+                    ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string()))
+                })?;
+            reply_rx
+        };
+        reply_rx
+            .recv()
+            .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn send_child_message(
+        &self,
+        text: String,
+    ) -> Result<MessageId, ServiceRuntimeError> {
+        let reply_rx = {
+            let guard = self.ingress.lock().unwrap();
+            if *guard {
+                return Err(ServiceRuntimeError::Stopping);
+            }
+            let (reply_tx, reply_rx) = channel();
+            self.command_tx
+                .send(RuntimeCommand::SendChildMessage {
+                    text,
+                    reply: reply_tx,
+                })
+                .map_err(|e| {
+                    ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string()))
+                })?;
+            reply_rx
+        };
+        reply_rx
+            .recv()
+            .map_err(|e| ServiceRuntimeError::Scheduler(SchedulerError::Channel(e.to_string())))?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_parent_message(
+        &self,
+        message: ChatMessage,
+    ) -> Result<(), ServiceRuntimeError> {
+        let reply_rx = {
+            let guard = self.ingress.lock().unwrap();
+            if *guard {
+                return Err(ServiceRuntimeError::Stopping);
+            }
+            let (reply_tx, reply_rx) = channel();
+            self.command_tx
+                .send(RuntimeCommand::PublishParentMessage {
+                    message,
                     reply: reply_tx,
                 })
                 .map_err(|e| {
@@ -8596,5 +8726,673 @@ mod tests {
         // Action and anchor are removed
         assert!(coordinator.state.active_actions.is_empty());
         assert!(!coordinator.monotonic_timers.contains_key(&timer_id));
+    }
+
+    // ============================================================================
+    // SLICE 3C: CHAT RUNTIME SEAMS TESTS
+    // ============================================================================
+
+    #[test]
+    fn test_send_child_message_empty_text_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let res = handle.send_child_message("".to_string());
+        assert!(matches!(res, Err(ServiceRuntimeError::InvalidInput(_))));
+
+        let snap = handle.query_status().unwrap();
+        assert_eq!(snap.active_actions.len(), 0);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_whitespace_only_text_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let whitespace_samples = [" ", "\t", "\n", "\r\n", "   \t \n \r  "];
+        for sample in whitespace_samples {
+            let res = handle.send_child_message(sample.to_string());
+            assert!(matches!(res, Err(ServiceRuntimeError::InvalidInput(_))));
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_4096_bytes_accepted() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let text = "a".repeat(4096);
+        let res = handle.send_child_message(text);
+        assert!(res.is_ok());
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_4097_bytes_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let text = "a".repeat(4097);
+        let res = handle.send_child_message(text);
+        assert!(matches!(res, Err(ServiceRuntimeError::InvalidInput(_))));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_utf8_multibyte_boundary_accepted_and_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        // "🦀" is 4 UTF-8 bytes. 1024 * 4 = 4096 bytes -> Valid
+        let valid_crab = "🦀".repeat(1024);
+        assert_eq!(valid_crab.as_bytes().len(), 4096);
+        let res_ok = handle.send_child_message(valid_crab);
+        assert!(res_ok.is_ok());
+
+        // 1024 crabs + "a" = 4097 bytes -> Invalid
+        let invalid_crab = format!("{}a", "🦀".repeat(1024));
+        assert_eq!(invalid_crab.as_bytes().len(), 4097);
+        let res_err = handle.send_child_message(invalid_crab);
+        assert!(matches!(res_err, Err(ServiceRuntimeError::InvalidInput(_))));
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_preserves_leading_trailing_whitespace() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime start must succeed");
+
+        let handle = runtime.handle().clone();
+        let raw_text = "  \t Hello from Child! \n  ";
+        let res = handle.send_child_message(raw_text.to_string());
+        assert!(res.is_ok());
+
+        let persisted = store.state.lock().unwrap();
+        assert_eq!(persisted.telegram_outbox.len(), 1);
+        match &persisted.telegram_outbox[0].payload {
+            TelegramPayload::Chat { message } => {
+                assert_eq!(message.text, raw_text);
+            }
+            other => panic!("Expected TelegramPayload::Chat, got {:?}", other),
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_outbox_entry_id_raw_bytes_mapped_to_message_id() {
+        let mut coordinator = setup_test_coordinator();
+
+        let message_id = coordinator
+            .handle_send_child_message("Test mapping".to_string())
+            .unwrap();
+
+        assert_eq!(coordinator.state.telegram_outbox.len(), 1);
+        let entry = &coordinator.state.telegram_outbox[0];
+        assert_eq!(message_id, MessageId(entry.entry_id.0));
+
+        match &entry.payload {
+            TelegramPayload::Chat { message } => {
+                assert_eq!(message.id, MessageId(entry.entry_id.0));
+                assert_eq!(message.id, message_id);
+            }
+            other => panic!("Expected Chat payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_send_child_message_uses_service_runtime_clock_utc() {
+        let mut coordinator = setup_test_coordinator();
+        *coordinator.clock.utc.lock().unwrap() = 1700000000000;
+
+        let _ = coordinator
+            .handle_send_child_message("Clock test".to_string())
+            .unwrap();
+
+        let entry = &coordinator.state.telegram_outbox[0];
+        match &entry.payload {
+            TelegramPayload::Chat { message } => {
+                assert_eq!(message.timestamp, UtcDateTime(1700000000000));
+            }
+            other => panic!("Expected Chat payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_send_child_message_sets_sender_child_and_accepted_by_service() {
+        let mut coordinator = setup_test_coordinator();
+
+        let _ = coordinator
+            .handle_send_child_message("Shape test".to_string())
+            .unwrap();
+
+        let entry = &coordinator.state.telegram_outbox[0];
+        assert_eq!(entry.attempt_count, 0);
+        assert_eq!(entry.last_error, None);
+
+        match &entry.payload {
+            TelegramPayload::Chat { message } => {
+                assert_eq!(message.sender, MessageSender::Child);
+                assert_eq!(message.delivery_status, DeliveryStatus::AcceptedByService);
+                assert_eq!(message.text, "Shape test");
+            }
+            other => panic!("Expected Chat payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_send_child_message_appends_to_outbox_and_preserves_existing_entries() {
+        let mut coordinator = setup_test_coordinator();
+
+        let existing_entry_id = OutboxEntryId([0xEE; 16]);
+        coordinator.state.telegram_outbox.push(TelegramOutboxEntry {
+            entry_id: existing_entry_id,
+            payload: TelegramPayload::ServiceNotification {
+                text: "Prior notification".to_string(),
+            },
+            attempt_count: 2,
+            last_error: Some("Temporary network error".to_string()),
+        });
+
+        let msg_id = coordinator
+            .handle_send_child_message("Appended message".to_string())
+            .unwrap();
+
+        assert_eq!(coordinator.state.telegram_outbox.len(), 2);
+        assert_eq!(
+            coordinator.state.telegram_outbox[0].entry_id,
+            existing_entry_id
+        );
+        assert_eq!(coordinator.state.telegram_outbox[0].attempt_count, 2);
+
+        let second = &coordinator.state.telegram_outbox[1];
+        assert_eq!(second.entry_id.0, msg_id.0);
+        assert_eq!(second.attempt_count, 0);
+    }
+
+    #[test]
+    fn test_send_child_message_durable_commit_precedes_reply() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime start must succeed");
+
+        let handle = runtime.handle().clone();
+        let res = handle.send_child_message("Durable test".to_string());
+        let msg_id = res.expect("Send child message must succeed");
+
+        // When reply is received, persistent store already contains the message
+        let persisted = store.state.lock().unwrap();
+        assert_eq!(persisted.telegram_outbox.len(), 1);
+        assert_eq!(persisted.telegram_outbox[0].entry_id.0, msg_id.0);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_persistence_failure_leaves_state_unmodified() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime start must succeed");
+
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        // Inject save failure
+        store.fail_saves.store(true, Ordering::SeqCst);
+
+        let res = handle.send_child_message("Fail persistence".to_string());
+        assert!(matches!(res, Err(ServiceRuntimeError::Persistence(_))));
+
+        // Authoritative store state has no outbox entries
+        assert!(store.state.lock().unwrap().telegram_outbox.is_empty());
+
+        // No ChatMessageReceived event emitted
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::ChatMessageReceived { .. } = ev {
+                panic!("ChatMessageReceived must not be emitted on persistence failure");
+            }
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_retry_after_persistence_failure_allocates_next_id() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime start must succeed");
+
+        let handle = runtime.handle().clone();
+
+        // Injected failure
+        store.fail_saves.store(true, Ordering::SeqCst);
+        let res_fail = handle.send_child_message("Retry message".to_string());
+        assert!(matches!(res_fail, Err(ServiceRuntimeError::Persistence(_))));
+
+        // Clear failure and retry
+        store.fail_saves.store(false, Ordering::SeqCst);
+        let res_ok = handle.send_child_message("Retry message".to_string());
+        let msg_id = res_ok.expect("Retry must succeed");
+
+        let persisted = store.state.lock().unwrap();
+        assert_eq!(persisted.telegram_outbox.len(), 1);
+        assert_eq!(persisted.telegram_outbox[0].entry_id.0, msg_id.0);
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_emits_no_chat_message_received_event() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+        let sub = handle.subscribe_events().unwrap();
+
+        let res = handle.send_child_message("Outbound child message".to_string());
+        assert!(res.is_ok());
+
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::ChatMessageReceived { .. } = ev {
+                panic!("SendChildMessage must NOT emit Event::ChatMessageReceived (no echo)");
+            }
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_send_child_message_after_stopping_begins_is_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let _ = runtime.stop();
+
+        let res = handle.send_child_message("Message after stop".to_string());
+        assert!(matches!(res, Err(ServiceRuntimeError::Stopping)));
+    }
+
+    #[test]
+    fn test_publish_parent_message_with_child_sender_rejected() {
+        let mut coordinator = setup_test_coordinator();
+
+        let child_msg = ChatMessage {
+            id: MessageId([0x11; 16]),
+            sender: MessageSender::Child,
+            text: "Spoofed child sender".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = coordinator.handle_publish_parent_message(child_msg);
+        assert!(matches!(res, Err(ServiceRuntimeError::InvalidInput(_))));
+        assert!(coordinator.state.telegram_outbox.is_empty());
+    }
+
+    #[test]
+    fn test_publish_parent_message_delivers_exact_message_to_subscriber() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x22; 16]),
+            sender: MessageSender::Parent,
+            text: "Hello from parent in Telegram!".to_string(),
+            timestamp: UtcDateTime(12345678),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = coordinator.handle_publish_parent_message(parent_msg.clone());
+        assert!(res.is_ok());
+
+        let ev = sub
+            .receiver
+            .try_recv()
+            .expect("Event must be delivered to subscriber");
+        match ev {
+            Event::ChatMessageReceived { message } => {
+                assert_eq!(message, parent_msg);
+            }
+            other => panic!("Expected ChatMessageReceived, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_publish_parent_message_with_zero_subscribers_succeeds_without_persistence() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let initial_state = PersistentState {
+            desired_internet_state: DesiredInternetState::Unrestricted,
+            active_actions: Vec::new(),
+            internet_retry: None,
+            telegram_outbox: Vec::new(),
+        };
+
+        let store = FakeStateStore::new(initial_state.clone(), log.clone());
+        let gate = FakeInternetGate::new(InternetState::Unrestricted, log.clone());
+        let power = FakePowerController::new(log.clone());
+        let clock = FakeClock::new(1000000);
+        let id_source = FakeIdSource::new();
+        let retry = TestRetryPolicy::new(Duration::from_secs(5));
+
+        let bootstrapped = sample_bootstrapped_state(initial_state);
+        let mut runtime = ServiceRuntime::start_with_store(
+            bootstrapped,
+            store.clone(),
+            gate,
+            power,
+            clock,
+            id_source,
+            retry,
+            Some(log),
+        )
+        .expect("Runtime start must succeed");
+
+        let handle = runtime.handle().clone();
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x33; 16]),
+            sender: MessageSender::Parent,
+            text: "Parent msg with zero subscribers".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = handle.publish_parent_message(parent_msg);
+        assert!(res.is_ok());
+
+        // Zero saves, zero outbox mutations
+        assert_eq!(store.save_count.load(Ordering::SeqCst), 0);
+        assert!(store.state.lock().unwrap().telegram_outbox.is_empty());
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_publish_parent_message_preserves_original_timestamp_and_status() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x44; 16]),
+            sender: MessageSender::Parent,
+            text: "Timestamp status test".to_string(),
+            timestamp: UtcDateTime(9876543210),
+            delivery_status: DeliveryStatus::DeliveredToTray,
+        };
+
+        let res = coordinator.handle_publish_parent_message(parent_msg.clone());
+        assert!(res.is_ok());
+
+        let ev = sub.receiver.try_recv().expect("Event must be delivered");
+        match ev {
+            Event::ChatMessageReceived { message } => {
+                assert_eq!(message.timestamp, UtcDateTime(9876543210));
+                assert_eq!(message.delivery_status, DeliveryStatus::DeliveredToTray);
+            }
+            other => panic!("Expected ChatMessageReceived, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_publish_parent_message_does_not_mutate_state_or_outbox() {
+        let mut coordinator = setup_test_coordinator();
+
+        let initial_state_clone = coordinator.state.clone();
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x55; 16]),
+            sender: MessageSender::Parent,
+            text: "No mutation test".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = coordinator.handle_publish_parent_message(parent_msg);
+        assert!(res.is_ok());
+
+        assert_eq!(coordinator.state, initial_state_clone);
+    }
+
+    #[test]
+    fn test_publish_parent_message_offline_is_never_replayed_to_future_subscribers() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let msg_p1 = ChatMessage {
+            id: MessageId([0x61; 16]),
+            sender: MessageSender::Parent,
+            text: "P1: Sent while offline".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        // Publish P1 with 0 subscribers
+        let res1 = handle.publish_parent_message(msg_p1);
+        assert!(res1.is_ok());
+
+        // Later, subscriber connects
+        let sub = handle.subscribe_events().unwrap();
+
+        // Verify sub receives no historical P1
+        while let Ok(ev) = sub.receiver.try_recv() {
+            if let Event::ChatMessageReceived { message } = ev {
+                if message.id == MessageId([0x61; 16]) {
+                    panic!("Historical P1 message must NEVER be replayed to new subscribers");
+                }
+            }
+        }
+
+        // Publish P2 after subscription
+        let msg_p2 = ChatMessage {
+            id: MessageId([0x62; 16]),
+            sender: MessageSender::Parent,
+            text: "P2: Sent while online".to_string(),
+            timestamp: UtcDateTime(2000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+        let res2 = handle.publish_parent_message(msg_p2.clone());
+        assert!(res2.is_ok());
+
+        // Receiver gets exactly P2
+        let ev = sub.receiver.try_recv().expect("P2 must be delivered");
+        match ev {
+            Event::ChatMessageReceived { message } => {
+                assert_eq!(message, msg_p2);
+            }
+            other => panic!("Expected ChatMessageReceived(P2), got {:?}", other),
+        }
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn test_publish_parent_message_nonblocking_with_disconnected_subscriber() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        // Disconnect subscriber
+        drop(sub.receiver);
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x77; 16]),
+            sender: MessageSender::Parent,
+            text: "Disconnected sub message".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = coordinator.handle_publish_parent_message(parent_msg);
+        assert!(res.is_ok());
+
+        // Disconnected subscriber is pruned
+        assert_eq!(coordinator.subscribers.len(), 0);
+    }
+
+    #[test]
+    fn test_publish_parent_message_nonblocking_with_full_subscriber_queue() {
+        let mut coordinator = setup_test_coordinator();
+
+        let (sub_tx, sub_rx) = channel();
+        coordinator.handle_subscribe_events(sub_tx);
+        let sub = sub_rx.recv().unwrap().unwrap();
+
+        // Fill 64-event queue
+        for i in 0..64 {
+            let msg = ChatMessage {
+                id: MessageId([i as u8; 16]),
+                sender: MessageSender::Parent,
+                text: format!("Queue fill {i}"),
+                timestamp: UtcDateTime(1000000 + i as i64),
+                delivery_status: DeliveryStatus::AcceptedByTelegram,
+            };
+            let res = coordinator.handle_publish_parent_message(msg);
+            assert!(res.is_ok());
+        }
+
+        // 65th event causes overflow pruning without blocking
+        let overflow_msg = ChatMessage {
+            id: MessageId([0xFF; 16]),
+            sender: MessageSender::Parent,
+            text: "Overflow message".to_string(),
+            timestamp: UtcDateTime(2000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+        let res_overflow = coordinator.handle_publish_parent_message(overflow_msg);
+        assert!(res_overflow.is_ok());
+
+        // Full subscriber was pruned
+        assert_eq!(coordinator.subscribers.len(), 0);
+
+        drop(sub.receiver);
+    }
+
+    #[test]
+    fn test_publish_parent_message_after_stopping_begins_is_rejected() {
+        let (mut runtime, _clock, _log) = setup_test_runtime();
+        let handle = runtime.handle().clone();
+
+        let _ = runtime.stop();
+
+        let parent_msg = ChatMessage {
+            id: MessageId([0x88; 16]),
+            sender: MessageSender::Parent,
+            text: "Stopping parent message".to_string(),
+            timestamp: UtcDateTime(1000000),
+            delivery_status: DeliveryStatus::AcceptedByTelegram,
+        };
+
+        let res = handle.publish_parent_message(parent_msg);
+        assert!(matches!(res, Err(ServiceRuntimeError::Stopping)));
     }
 }
