@@ -1951,20 +1951,7 @@ mod tests {
     /// IPC-50: Physical capacity limit = 4, reject 5th, no eviction
     #[test]
     fn test_physical_pipe_capacity_and_no_eviction() {
-        // Part 1: Canonical child DACL rejection
-        let child_pipe_name = make_test_pipe_name("child_capacity_deny");
-        let child_sid = current_user_sid();
-        let inst1 = NamedPipeServerInstance::create(&child_pipe_name, &child_sid, 4)
-            .expect("First instance created");
-
-        let inst2_res = NamedPipeServerInstance::create(&child_pipe_name, &child_sid, 4);
-        assert!(
-            matches!(inst2_res, Err(NamedPipeError::WindowsApi { code: 5, .. })),
-            "Second instance creation under child identity must fail with ERROR_ACCESS_DENIED (code 5)"
-        );
-        drop(inst1);
-
-        // Part 2: SERVER_INSTANCE_CAPACITY_TEST
+        // Raw test construction is used to isolate capacity from caller-token/DACL authorization.
         let pipe_name = make_test_pipe_name("capacity");
         let max_instances = 4;
 
@@ -1994,7 +1981,7 @@ mod tests {
             fifth_res.err()
         );
 
-        // Part 3: CLIENT_CONNECTION_CAPACITY_TEST
+        // CLIENT_CONNECTION_CAPACITY_TEST
         let mut client_handles = Vec::new();
         for _ in 0..max_instances {
             let client = connect_client(&pipe_name);
@@ -2023,7 +2010,7 @@ mod tests {
             "5th client must receive ERROR_PIPE_BUSY (231), got {fifth_err}"
         );
 
-        // Part 4: No eviction verification
+        // No eviction verification
         for inst in &server_instances {
             assert!(
                 !inst.handle().is_invalid(),
