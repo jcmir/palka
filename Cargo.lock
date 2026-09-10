@@ -133,6 +133,7 @@ dependencies = [
  "palka-core",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
